@@ -1,0 +1,310 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:MrloicMinervaDPN.ViewModels"
+        xmlns:models="using:MrloicMinervaDPN.Models"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d" d:DesignWidth="960" d:DesignHeight="640"
+        x:Class="MrloicMinervaDPN.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Icon="/Assets/avalonia-logo.ico"
+        Title="Minerva Archive — DPN Worker"
+        MinWidth="800" MinHeight="540"
+        Width="960" Height="640">
+
+    <Design.DataContext>
+        <vm:MainWindowViewModel/>
+    </Design.DataContext>
+
+    <Window.Styles>
+        <Style Selector="TextBlock.SectionHeader">
+            <Setter Property="FontSize" Value="10"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="LetterSpacing" Value="1.5"/>
+            <Setter Property="Foreground" Value="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
+            <Setter Property="Margin" Value="0 14 0 6"/>
+        </Style>
+        <Style Selector="Button.Sidebar">
+            <Setter Property="HorizontalAlignment" Value="Stretch"/>
+            <Setter Property="HorizontalContentAlignment" Value="Center"/>
+            <Setter Property="Margin" Value="0 0 0 5"/>
+            <Setter Property="Padding" Value="10 7"/>
+        </Style>
+        <Style Selector="TextBox.Setting">
+            <Setter Property="Margin" Value="0 0 0 8"/>
+        </Style>
+        <Style Selector="NumericUpDown.Setting">
+            <Setter Property="Margin" Value="0 0 0 8"/>
+            <Setter Property="FormatString" Value="0"/>
+            <Setter Property="ShowButtonSpinner" Value="True"/>
+        </Style>
+    </Window.Styles>
+
+    <!-- Root: sidebar | main -->
+    <Grid ColumnDefinitions="220,*">
+
+        <!-- ══════════════════ SIDEBAR ══════════════════ -->
+        <Border Grid.Column="0"
+                Background="{DynamicResource SystemControlBackgroundChromeMediumLowBrush}"
+                BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}"
+                BorderThickness="0 0 1 0">
+            <DockPanel LastChildFill="False" Margin="14 20 14 16">
+
+                <!-- App title -->
+                <StackPanel DockPanel.Dock="Top" Spacing="0" Margin="0 0 0 16">
+                    <TextBlock Text="MINERVA"
+                               FontSize="22" FontWeight="Bold" LetterSpacing="3"
+                               HorizontalAlignment="Center"/>
+                    <TextBlock Text="DPN Worker"
+                               FontSize="11" HorizontalAlignment="Center"
+                               Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
+                </StackPanel>
+
+                <!-- Login status indicator -->
+                <Border DockPanel.Dock="Top" CornerRadius="20" Padding="14 7"
+                        HorizontalAlignment="Center" Margin="0 0 0 16"
+                        Background="#1A4CAF50"
+                        IsVisible="{Binding IsLoggedIn}">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <Ellipse Width="8" Height="8" Fill="#4CAF50" VerticalAlignment="Center"/>
+                        <TextBlock Text="Logged in" FontSize="12" VerticalAlignment="Center" Foreground="#4CAF50"/>
+                    </StackPanel>
+                </Border>
+                <Border DockPanel.Dock="Top" CornerRadius="20" Padding="14 7"
+                        HorizontalAlignment="Center" Margin="0 0 0 16"
+                        Background="#1ACC4444"
+                        IsVisible="{Binding !IsLoggedIn}">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <Ellipse Width="8" Height="8" Fill="#CC4444" VerticalAlignment="Center"/>
+                        <TextBlock Text="Not logged in" FontSize="12" VerticalAlignment="Center" Foreground="#CC4444"/>
+                    </StackPanel>
+                </Border>
+
+                <!-- Authentication -->
+                <TextBlock DockPanel.Dock="Top" Classes="SectionHeader" Text="AUTHENTICATION"/>
+                <Button DockPanel.Dock="Top" Classes="Sidebar"
+                        Content="Login with Discord"
+                        Command="{Binding LoginCommand}"
+                        IsVisible="{Binding !IsLoggingIn}"/>
+                <Button DockPanel.Dock="Top" Classes="Sidebar"
+                        Content="Cancel Login"
+                        Command="{Binding CancelLoginCommand}"
+                        IsVisible="{Binding IsLoggingIn}"/>
+                <Button DockPanel.Dock="Top" Classes="Sidebar"
+                        Content="Logout"
+                        Command="{Binding LogoutCommand}"/>
+
+                <!-- Worker controls -->
+                <TextBlock DockPanel.Dock="Top" Classes="SectionHeader" Text="WORKER"/>
+                <Button DockPanel.Dock="Top" Classes="Sidebar"
+                        Content="▶  Start Worker"
+                        Command="{Binding StartWorkerCommand}"
+                        Background="#2E7D32" Foreground="White"/>
+                <Button DockPanel.Dock="Top" Classes="Sidebar"
+                        Content="■  Stop Worker"
+                        Command="{Binding StopWorkerCommand}"
+                        Background="#B71C1C" Foreground="White"/>
+
+                <!-- Running indicator + aggregate speeds -->
+                <StackPanel DockPanel.Dock="Top" Margin="0 8 0 0"
+                            IsVisible="{Binding IsRunning}" Spacing="4">
+                    <Border CornerRadius="20" Padding="12 6"
+                            HorizontalAlignment="Center"
+                            Background="#1A4CAF50">
+                        <StackPanel Orientation="Horizontal" Spacing="6">
+                            <Ellipse Width="8" Height="8" Fill="#4CAF50" VerticalAlignment="Center"/>
+                            <TextBlock Text="Running" FontSize="12" VerticalAlignment="Center" Foreground="#4CAF50"/>
+                        </StackPanel>
+                    </Border>
+                    <StackPanel HorizontalAlignment="Center" Spacing="2">
+                        <TextBlock Text="{Binding DownloadSpeedText}"
+                                   FontSize="12" FontFamily="Consolas,Menlo,monospace"
+                                   HorizontalAlignment="Center" Foreground="#42A5F5"
+                                   IsVisible="{Binding DownloadSpeedText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+                        <TextBlock Text="{Binding UploadSpeedText}"
+                                   FontSize="12" FontFamily="Consolas,Menlo,monospace"
+                                   HorizontalAlignment="Center" Foreground="#FF9800"
+                                   IsVisible="{Binding UploadSpeedText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+                    </StackPanel>
+                </StackPanel>
+
+            </DockPanel>
+        </Border>
+
+        <!-- ══════════════════ MAIN AREA ══════════════════ -->
+        <Grid Grid.Column="1" RowDefinitions="Auto,*">
+
+            <!-- Settings panel -->
+            <Border Grid.Row="0" Padding="20 14"
+                    BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}"
+                    BorderThickness="0 0 0 1">
+                <Grid ColumnDefinitions="*,20,*,20,*">
+
+                    <!-- Servers -->
+                    <StackPanel Grid.Column="0">
+                        <TextBlock Classes="SectionHeader" Text="SERVERS" Margin="0 0 0 6"/>
+                        <TextBlock Text="API Server" FontSize="11" Margin="0 0 0 2"
+                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
+                        <TextBox Classes="Setting" Text="{Binding ServerUrl}"/>
+                        <TextBlock Text="Upload Server" FontSize="11" Margin="0 4 0 2"
+                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
+                        <TextBox Classes="Setting" Text="{Binding UploadServerUrl}"/>
+                    </StackPanel>
+
+                    <!-- Performance -->
+                    <StackPanel Grid.Column="2">
+                        <TextBlock Classes="SectionHeader" Text="PERFORMANCE" Margin="0 0 0 6"/>
+                        <TextBlock Text="Concurrency" FontSize="11" Margin="0 0 0 2"
+                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
+                        <NumericUpDown Classes="Setting" Value="{Binding Concurrency}"
+                                       Minimum="1" Maximum="32" Increment="1"/>
+                        <TextBlock Text="Batch Size" FontSize="11" Margin="0 0 0 2"
+                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
+                        <NumericUpDown Classes="Setting" Value="{Binding BatchSize}"
+                                       Minimum="1" Maximum="100" Increment="1"/>
+                        <TextBlock Text="aria2c Connections" FontSize="11" Margin="0 0 0 2"
+                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
+                        <NumericUpDown Classes="Setting" Value="{Binding Aria2cConnections}"
+                                       Minimum="1" Maximum="64" Increment="1"/>
+                    </StackPanel>
+
+                    <!-- Storage -->
+                    <StackPanel Grid.Column="4">
+                        <TextBlock Classes="SectionHeader" Text="STORAGE" Margin="0 0 0 6"/>
+                        <TextBlock Text="Temp Directory" FontSize="11" Margin="0 0 0 2"
+                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
+                        <TextBox Classes="Setting" Text="{Binding TempDir}"/>
+                        <CheckBox Content="Keep files after upload"
+                                  IsChecked="{Binding KeepFiles}"
+                                  Margin="0 6 0 0"/>
+                        <TextBlock Text="RAM-only threshold (MB, 0=off)" FontSize="11" Margin="0 8 0 2"
+                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                   ToolTip.Tip="Files whose reported size is at or below this value are downloaded into RAM only and never written to disk. Set to 0 to always use disk."/>
+                        <NumericUpDown Classes="Setting" Value="{Binding InMemoryThresholdMb}"
+                                       Minimum="0" Maximum="1048576" Increment="1"
+                                       FormatString="0"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+
+            <!-- Tabs -->
+            <TabControl Grid.Row="1">
+
+                <!-- Active Jobs tab -->
+                <TabItem Header="Active Jobs">
+                    <Panel Margin="16 12">
+                        <!-- Empty state -->
+                        <StackPanel VerticalAlignment="Center" HorizontalAlignment="Center"
+                                    Spacing="8"
+                                    IsVisible="{Binding !ActiveJobs.Count}">
+                            <TextBlock Text="No active jobs" FontSize="15"
+                                       Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                       HorizontalAlignment="Center"/>
+                            <TextBlock Text="Start the worker to begin downloading and uploading files."
+                                       FontSize="12"
+                                       Foreground="{DynamicResource SystemControlForegroundBaseLowBrush}"
+                                       HorizontalAlignment="Center"/>
+                        </StackPanel>
+
+                        <!-- Job list -->
+                        <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                      IsVisible="{Binding !!ActiveJobs.Count}">
+                            <ItemsControl ItemsSource="{Binding ActiveJobs}">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate x:DataType="models:JobProgressViewModel">
+                                        <Border Margin="0 0 0 6" Padding="12 10"
+                                                CornerRadius="6"
+                                                Background="{DynamicResource SystemControlBackgroundChromeMediumLowBrush}">
+                                            <Grid RowDefinitions="Auto,5,Auto,Auto" ColumnDefinitions="*,Auto,Auto">
+
+                                                <!-- filename -->
+                                                <TextBlock Grid.Row="0" Grid.Column="0"
+                                                           Text="{Binding Label}"
+                                                           FontSize="12"
+                                                           FontFamily="Consolas,Menlo,monospace"
+                                                           TextTrimming="CharacterEllipsis"
+                                                           VerticalAlignment="Center"/>
+
+                                                <!-- speed (only while active) -->
+                                                <TextBlock Grid.Row="0" Grid.Column="1"
+                                                           Text="{Binding SpeedText}"
+                                                           FontSize="11"
+                                                           FontFamily="Consolas,Menlo,monospace"
+                                                           Margin="10 0 10 0"
+                                                           VerticalAlignment="Center"
+                                                           IsVisible="{Binding IsActive}"
+                                                           Foreground="#4CAF50"/>
+
+                                                <!-- status — normal (pending / downloading / uploading / done) -->
+                                                <TextBlock Grid.Row="0" Grid.Column="2"
+                                                           Text="{Binding StatusText}"
+                                                           FontSize="11" FontWeight="SemiBold"
+                                                           VerticalAlignment="Center"
+                                                           Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                           IsVisible="{Binding IsNormal}"/>
+
+                                                <!-- status — retrying (orange) -->
+                                                <TextBlock Grid.Row="0" Grid.Column="2"
+                                                           Text="{Binding StatusText}"
+                                                           FontSize="11" FontWeight="SemiBold"
+                                                           VerticalAlignment="Center"
+                                                           Foreground="#FF9800"
+                                                           IsVisible="{Binding IsRetrying}"/>
+
+                                                <!-- status — failed (red) -->
+                                                <TextBlock Grid.Row="0" Grid.Column="2"
+                                                           Text="{Binding StatusText}"
+                                                           FontSize="11" FontWeight="Bold"
+                                                           VerticalAlignment="Center"
+                                                           Foreground="#EF5350"
+                                                           IsVisible="{Binding IsFailed}"/>
+
+                                                <!-- progress bar -->
+                                                <ProgressBar Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3"
+                                                             Value="{Binding Progress}"
+                                                             Minimum="0" Maximum="100" Height="5"
+                                                             Margin="0 2 0 0"/>
+
+                                                <!-- error detail (shown on retrying + failed) -->
+                                                <TextBlock Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="3"
+                                                           Text="{Binding ErrorMessage}"
+                                                           FontSize="11"
+                                                           FontFamily="Consolas,Menlo,monospace"
+                                                           TextWrapping="Wrap"
+                                                           Foreground="#EF5350"
+                                                           Margin="0 5 0 0"
+                                                           IsVisible="{Binding HasError}"/>
+                                            </Grid>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </ScrollViewer>
+                    </Panel>
+                </TabItem>
+
+                <!-- Log tab -->
+                <TabItem Header="Log">
+                    <Grid RowDefinitions="*,Auto" Margin="16 12">
+                        <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto"
+                                      HorizontalScrollBarVisibility="Auto">
+                            <TextBox Text="{Binding LogText}"
+                                     IsReadOnly="True"
+                                     AcceptsReturn="True"
+                                     FontFamily="Consolas,Menlo,monospace"
+                                     FontSize="12"
+                                     BorderThickness="0"
+                                     Background="Transparent"
+                                     TextWrapping="NoWrap"/>
+                        </ScrollViewer>
+                        <Button Grid.Row="1" Content="Clear Log"
+                                HorizontalAlignment="Right"
+                                Margin="0 6 0 0"
+                                Command="{Binding ClearLogCommand}"/>
+                    </Grid>
+                </TabItem>
+
+            </TabControl>
+        </Grid>
+    </Grid>
+</Window>
