@@ -14,24 +14,7 @@ using System.Threading.Channels;
 using System.Threading.Tasks;
 using MrloicMinervaDPN.Models;
 
-namespace MrloicMinervaDPN.Services
-{
-
-public sealed class WorkerSettings
-{
-    public string ServerUrl { get; set; } = "https://api.minerva-archive.org";
-    public string UploadServerUrl { get; set; } = "https://gate.minerva-archive.org";
-    public int Concurrency { get; set; } = 2;
-    public int BatchSize { get; set; } = 10;
-    public int Aria2cConnections { get; set; } = 8;
-    public string TempDir { get; set; } = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".minerva-dpn", "tmp");
-    public bool KeepFiles { get; set; } = false;
-    /// <summary>Files whose known size is at or below this threshold are kept entirely in
-    /// RAM — never written to <see cref="TempDir"/>. 0 = always write to disk.</summary>
-    public long InMemoryThresholdBytes { get; set; } = 0;
-}
-
+namespace MrloicMinervaDPN.Services;
 public sealed class MinervaWorkerService
 {
     private const string Version = "1.2.4";
@@ -277,7 +260,7 @@ public sealed class MinervaWorkerService
                 sessionId = doc.RootElement.GetProperty("session_id").GetString();
                 break;
             }
-            catch (HttpRequestException) when (attempt < 12)
+            catch (HttpRequestException ex) when (attempt < 12 && (ex.StatusCode is null || IsRetriable((int)ex.StatusCode.Value)))
             {
                 await Task.Delay(TimeSpan.FromSeconds(RetrySleep(attempt)), ct);
             }
@@ -298,7 +281,14 @@ public sealed class MinervaWorkerService
             {
                 try
                 {
-                    var content = new ByteArrayContent(chunk);
+                    long chunkSent = 0;
+                    using var ms = new MemoryStream(chunk, 0, chunk.Length, writable: false);
+                    var progressStream = new ProgressStream(ms, written =>
+                    {
+                        chunkSent += written;
+                        onProgress(sent + chunkSent, fileSize);
+                    });
+                    var content = new StreamContent(progressStream);
                     content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
                     var resp = await client.PostAsync(
                         $"{uploadServerUrl}/api/upload/{fileId}/chunk?session_id={sessionId}",
@@ -314,14 +304,13 @@ public sealed class MinervaWorkerService
                     resp.EnsureSuccessStatusCode();
                     break;
                 }
-                catch (HttpRequestException) when (attempt < 30)
+                catch (HttpRequestException ex) when (attempt < 30 && (ex.StatusCode is null || IsRetriable((int)ex.StatusCode.Value)))
                 {
                     await Task.Delay(TimeSpan.FromSeconds(RetrySleep(attempt, 20)), ct);
                 }
             }
 
             sent += read;
-            onProgress(sent, fileSize);
         }
 
         // 3. Finish
@@ -345,7 +334,7 @@ public sealed class MinervaWorkerService
                 resp.EnsureSuccessStatusCode();
                 break;
             }
-            catch (HttpRequestException) when (attempt < 12)
+            catch (HttpRequestException ex) when (attempt < 12 && (ex.StatusCode is null || IsRetriable((int)ex.StatusCode.Value)))
             {
                 await Task.Delay(TimeSpan.FromSeconds(RetrySleep(attempt, 20)), ct);
             }
@@ -395,15 +384,21 @@ public sealed class MinervaWorkerService
         }
     }
 
+    private static string ExceptionSummary(Exception ex) => ex switch
+    {
+        HttpRequestException { StatusCode: { } code } => $"HTTP {(int)code} {code}",
+        HttpRequestException => "connection error",
+        _ => ex.Message.Split('\n')[0].Trim()
+    };
+
     private static string BuildErrorMessage(Exception? ex, int totalAttempts)
     {
         if (ex is null) return "Unknown error";
-        var msg = ex.Message.Split('\n')[0].Trim();
-        return $"Failed after {totalAttempts} attempt{(totalAttempts != 1 ? "s" : "")}: {msg}";
+        return $"Failed after {totalAttempts} attempt{(totalAttempts != 1 ? "s" : "")}: {ExceptionSummary(ex)}";
     }
 
     private async Task ProcessJobAsync(WorkerSettings settings, string token,
-        JobProgressViewModel vm, JsonElement job, CancellationToken ct)
+        JobProgressViewModel vm, JsonElement job, Action<string> log, CancellationToken ct)
     {
         var fileId = job.GetProperty("file_id").GetInt32();
         var url = job.GetProperty("url").GetString()!;
@@ -415,7 +410,8 @@ public sealed class MinervaWorkerService
 
         UI(() =>
         {
-            vm.Label = destPath.Length <= 60 ? destPath : "..." + destPath[^57..];
+            var decoded = Uri.UnescapeDataString(destPath);
+            vm.Label = decoded.Length <= 60 ? decoded : "..." + decoded[^57..];
             vm.MaxAttempts = MaxRetries;
             vm.Status = JobStatus.Downloading;
         });
@@ -461,22 +457,32 @@ public sealed class MinervaWorkerService
                     vm.ResetSpeed();
                 });
 
-                Action<long, long> ulProgress = (s, t) => UI(() =>
+                long ulPrevSent = 0;
+                var ulSw = Stopwatch.StartNew();
+                Action<long, long> ulProgressTracked = (s, t) =>
                 {
-                    vm.BytesTransferred = s;
-                    vm.TotalBytes = t;
-                    vm.UpdateSpeed(s);
-                });
+                    var elapsed = ulSw.Elapsed.TotalSeconds;
+                    ulSw.Restart();
+                    var delta = s - ulPrevSent;
+                    ulPrevSent = s;
+                    UI(() =>
+                    {
+                        vm.BytesTransferred = s;
+                        vm.TotalBytes = t;
+                        if (elapsed > 0 && delta > 0)
+                            vm.ForceSetSpeed(delta / elapsed);
+                    });
+                };
 
                 if (inMemData is not null)
                 {
                     using var ms = new MemoryStream(inMemData);
-                    await UploadStreamAsync(settings.UploadServerUrl, token, fileId, ms, fileSize, ulProgress, ct);
+                    await UploadStreamAsync(settings.UploadServerUrl, token, fileId, ms, fileSize, ulProgressTracked, ct);
                 }
                 else
                 {
                     await using var fs = new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, true);
-                    await UploadStreamAsync(settings.UploadServerUrl, token, fileId, fs, fileSize, ulProgress, ct);
+                    await UploadStreamAsync(settings.UploadServerUrl, token, fileId, fs, fileSize, ulProgressTracked, ct);
                 }
 
                 uploaded = true;
@@ -485,7 +491,8 @@ public sealed class MinervaWorkerService
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
                 lastErr = ex;
-                var msg = $"Attempt {attempt}/{MaxRetries}: {ex.Message.Split('\n')[0].Trim()}";
+                var msg = $"Attempt {attempt}/{MaxRetries}: {ExceptionSummary(ex)}";
+                log($"FAIL [{vm.Label}] {msg}");
                 UI(() => { vm.ErrorMessage = msg; vm.SpeedText = ""; });
                 if (inMemData is null && File.Exists(localPath)) File.Delete(localPath);
                 if (attempt < MaxRetries)
@@ -499,6 +506,7 @@ public sealed class MinervaWorkerService
         if (!uploaded)
         {
             var errMsg = BuildErrorMessage(lastErr, MaxRetries);
+            log($"FAIL [{vm.Label}] {errMsg}");
             UI(() => { vm.Status = JobStatus.Failed; vm.SpeedText = ""; vm.ErrorMessage = errMsg; });
             try { await ReportJobAsync(settings.ServerUrl, token, fileId, "failed", error: errMsg, ct: ct); } catch { }
             return;
@@ -577,7 +585,7 @@ public sealed class MinervaWorkerService
             {
                 try
                 {
-                    await ProcessJobAsync(settings, token, vm, captured, ct);
+                    await ProcessJobAsync(settings, token, vm, captured, log, ct);
                     log($"{(vm.Status == JobStatus.Done ? "OK" : "FAIL")} {vm.Label}");
                 }
                 finally
@@ -596,5 +604,3 @@ public sealed class MinervaWorkerService
         log("Worker stopped.");
     }
 }
-
-} // namespace MrloicMinervaDPN.Services

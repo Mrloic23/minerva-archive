@@ -44,6 +44,7 @@ public partial class JobProgressViewModel : ObservableObject
         (BytesTransferred > 0, TotalBytes > 0) switch
         {
             (true,  true)  => $"{FormatSize(BytesTransferred)} / {FormatSize(TotalBytes)}",
+            (false, true)  => $"— / {FormatSize(TotalBytes)}",
             (true,  false) => $"{FormatSize(BytesTransferred)} / ?",
             _              => "",
         };
@@ -66,6 +67,14 @@ public partial class JobProgressViewModel : ObservableObject
         var bps = delta / elapsed;
         _lastSpeedBytes = bytesNow;
         _speedWatch.Restart();
+        CurrentSpeedBps = bps;
+        SpeedText = FormatSpeed(bps);
+    }
+
+    /// <summary>Directly sets the speed from an externally-measured rate (e.g. per-chunk
+    /// upload timing). Bypasses the time gate used by <see cref="UpdateSpeed"/>.</summary>
+    public void ForceSetSpeed(double bps)
+    {
         CurrentSpeedBps = bps;
         SpeedText = FormatSpeed(bps);
     }
