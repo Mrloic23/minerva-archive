@@ -27,6 +27,7 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private decimal _concurrency = 2;
     [ObservableProperty] private decimal _batchSize = 10;
     [ObservableProperty] private decimal _aria2cConnections = 8;
+    [ObservableProperty] private bool _autoInstallAria2c = true;
     [ObservableProperty] private string _tempDir = System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".minerva-dpn", "tmp");
     [ObservableProperty] private bool _keepFiles;
@@ -108,6 +109,7 @@ public partial class MainWindowViewModel : ViewModelBase
             Concurrency = (int)Concurrency,
             BatchSize = (int)BatchSize,
             Aria2cConnections = (int)Aria2cConnections,
+            AutoInstallAria2c = AutoInstallAria2c,
             TempDir = TempDir,
             KeepFiles = KeepFiles,
             InMemoryThresholdBytes = (long)(InMemoryThresholdMb * 1024 * 1024),
@@ -156,6 +158,15 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         _workerCts?.Cancel();
         AppendLog("Stopping worker...");
+    }
+
+    /// <summary>Called when the main window is closing. Cancels the worker and stops the
+    /// aria2c daemon synchronously so the process does not linger after the app exits.</summary>
+    public void Shutdown()
+    {
+        _loginCts?.Cancel();
+        _workerCts?.Cancel();
+        _workerService.Stop();
     }
 
     [RelayCommand]

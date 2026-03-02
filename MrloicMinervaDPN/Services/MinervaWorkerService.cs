@@ -12,6 +12,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using Aria2NET;
 using MrloicMinervaDPN.Models;
 
 namespace MrloicMinervaDPN.Services;
@@ -21,29 +22,82 @@ public sealed class MinervaWorkerService
     private const int MaxRetries = 3;
     private const int RetryDelaySeconds = 5;
     private const long UploadChunkSize = 8 * 1024 * 1024;
-    private const long Aria2cSizeThreshold = 5 * 1024 * 1024;
 
     private static readonly int[] RetriableStatusCodes = [408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524];
 
-    private readonly bool _hasAria2c = Which("aria2c") is not null;
+    private Process? _aria2cProc;
+    private Aria2NetClient? _aria2c;
+    private string _aria2cSecret = "";
 
     public ObservableCollection<JobProgressViewModel> ActiveJobs { get; } = [];
 
-    private static string? Which(string exe)
+    private static int FindFreePort()
     {
-        var pathExt = Environment.GetEnvironmentVariable("PATHEXT") ?? "";
-        var path = Environment.GetEnvironmentVariable("PATH") ?? "";
-        foreach (var dir in path.Split(Path.PathSeparator))
+        var l = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
+        l.Start();
+        int port = ((System.Net.IPEndPoint)l.LocalEndpoint).Port;
+        l.Stop();
+        return port;
+    }
+
+    private async Task<bool> TryStartAria2cDaemonAsync(int conns, bool autoInstall, Action<string> log, CancellationToken ct)
+    {
+        var aria2cPath = await Aria2cInstaller.EnsureAsync(log, autoInstall, ct);
+        if (aria2cPath is null) return false;
+
+        int port = FindFreePort();
+        _aria2cSecret = Guid.NewGuid().ToString("N");
+        var psi = new ProcessStartInfo(aria2cPath)
         {
-            var candidate = Path.Combine(dir, exe);
-            if (File.Exists(candidate)) return candidate;
-            foreach (var ext in pathExt.Split(';'))
-            {
-                var withExt = candidate + ext;
-                if (File.Exists(withExt)) return withExt;
-            }
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardError = true,
+        };
+        psi.ArgumentList.Add("--enable-rpc=true");
+        psi.ArgumentList.Add($"--rpc-listen-port={port}");
+        psi.ArgumentList.Add($"--rpc-secret={_aria2cSecret}");
+        psi.ArgumentList.Add("--rpc-listen-all=false");
+        psi.ArgumentList.Add("--quiet=true");
+        psi.ArgumentList.Add($"--max-connection-per-server={conns}");
+        psi.ArgumentList.Add($"--split={conns}");
+        psi.ArgumentList.Add("--auto-file-renaming=false");
+        psi.ArgumentList.Add("--allow-overwrite=true");
+        try
+        {
+            _aria2cProc = Process.Start(psi);
+            if (_aria2cProc is null) return false;
         }
-        return null;
+        catch { return false; }
+
+        var client = new Aria2NetClient($"http://127.0.0.1:{port}/jsonrpc", _aria2cSecret, retryCount: 1);
+        for (int i = 0; i < 20; i++)
+        {
+            try { await client.GetVersionAsync(ct); _aria2c = client; return true; }
+            catch { await Task.Delay(250, ct).ConfigureAwait(false); }
+        }
+        try { _aria2cProc?.Kill(); } catch { }
+        _aria2cProc = null;
+        return false;
+    }
+
+    private void StopAria2cDaemon()
+    {
+        var client = _aria2c;
+        _aria2c = null;
+        try { client?.ShutdownAsync().GetAwaiter().GetResult(); } catch { }
+        if (_aria2cProc is { HasExited: false })
+        {
+            try { if (!_aria2cProc.WaitForExit(3000)) _aria2cProc.Kill(); }
+            catch { }
+        }
+        _aria2cProc = null;
+    }
+
+    /// <summary>Cancels any running work and synchronously kills the aria2c daemon.  
+    /// Safe to call more than once and from any thread.</summary>
+    public void Stop()
+    {
+        StopAria2cDaemon();
     }
 
     private static void AddWorkerHeaders(HttpClient client, string token)
@@ -85,60 +139,67 @@ public sealed class MinervaWorkerService
     }
 
     private async Task DownloadFileAsync(string url, string dest, int aria2cConns, long knownSize,
-        CancellationToken ct, Action<long, long>? onProgress = null)
+        CancellationToken ct, Action<long, long, long>? onProgress = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-        bool useAria2c = _hasAria2c && (knownSize == 0 || knownSize >= Aria2cSizeThreshold);
-        if (useAria2c)
+        if (_aria2c is { } aria2c)
         {
-            var psi = new ProcessStartInfo("aria2c",
-                $"--max-connection-per-server={aria2cConns} --split={aria2cConns} " +
-                $"--min-split-size=1M --dir \"{Path.GetDirectoryName(dest)}\" " +
-                $"--out \"{Path.GetFileName(dest)}\" --auto-file-renaming=false " +
-                "--allow-overwrite=true --console-log-level=warn --retry-wait=3 " +
-                $"--max-tries=5 --timeout=60 --connect-timeout=15 \"{url}\"")
+            string? gid = null;
+            try
             {
-                RedirectStandardError = true,
-                UseShellExecute = false,
-            };
-            using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start aria2c");
-            // Poll written bytes for progress while aria2c runs (best-effort)
-            if (onProgress != null)
-            {
-                _ = Task.Run(async () =>
-                {
-                    while (!proc.HasExited)
+                gid = await aria2c.AddUriAsync(
+                    [url],
+                    new Dictionary<string, object>
                     {
-                        try { if (File.Exists(dest)) onProgress(new FileInfo(dest).Length, knownSize); }
-                        catch { }
-                        await Task.Delay(400).ConfigureAwait(false);
-                    }
-                });
+                        { "dir",                      Path.GetDirectoryName(dest)! },
+                        { "out",                      Path.GetFileName(dest) },
+                        { "max-connection-per-server", aria2cConns.ToString() },
+                        { "split",                    aria2cConns.ToString() },
+                        { "min-split-size",           "1M" },
+                        { "allow-overwrite",          "true" },
+                        { "auto-file-renaming",       "false" },
+                    }, cancellationToken: ct);
+
+                while (true)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    await Task.Delay(400, ct);
+                    var status = await aria2c.TellStatusAsync(gid, ct);
+                    onProgress?.Invoke(status.CompletedLength, status.TotalLength, status.DownloadSpeed);
+                    if (status.Status == "complete") break;
+                    if (status.Status == "error")
+                        throw new InvalidOperationException(
+                            $"aria2c error: {status.ErrorMessage ?? status.ErrorCode ?? "unknown"}");
+                }
+                try { await aria2c.RemoveDownloadResultAsync(gid); } catch { }
+                return;
             }
-            await proc.WaitForExitAsync(ct);
-            if (proc.ExitCode != 0)
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
-                var err = await proc.StandardError.ReadToEndAsync(ct);
-                throw new InvalidOperationException($"aria2c exit {proc.ExitCode}: {err[..Math.Min(200, err.Length)]}");
+                if (gid != null)
+                {
+                    try { await aria2c.ForceRemoveAsync(gid); } catch { }
+                    try { await aria2c.RemoveDownloadResultAsync(gid); } catch { }
+                }
+                throw;
             }
         }
-        else
+
+        // Fallback: plain HTTP streaming
+        using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(300) };
+        using var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
+        resp.EnsureSuccessStatusCode();
+        var total = resp.Content.Headers.ContentLength ?? knownSize;
+        await using var fs = new FileStream(dest, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, true);
+        var buf = new byte[1 << 20];
+        long received = 0;
+        var stream = await resp.Content.ReadAsStreamAsync(ct);
+        int read;
+        while ((read = await stream.ReadAsync(buf, ct)) > 0)
         {
-            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(300) };
-            using var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
-            resp.EnsureSuccessStatusCode();
-            var total = resp.Content.Headers.ContentLength ?? knownSize;
-            await using var fs = new FileStream(dest, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, true);
-            var buf = new byte[1 << 20];
-            long received = 0;
-            var stream = await resp.Content.ReadAsStreamAsync(ct);
-            int read;
-            while ((read = await stream.ReadAsync(buf, ct)) > 0)
-            {
-                await fs.WriteAsync(buf.AsMemory(0, read), ct);
-                received += read;
-                onProgress?.Invoke(received, total);
-            }
+            await fs.WriteAsync(buf.AsMemory(0, read), ct);
+            received += read;
+            onProgress?.Invoke(received, total, 0);
         }
     }
 
@@ -150,10 +211,10 @@ public sealed class MinervaWorkerService
     /// </summary>
     private async Task<(byte[]? memData, string? localPath)> DownloadSmartAsync(
         string url, string fallbackLocalPath, int aria2cConns, long knownSize,
-        long inMemThreshold, CancellationToken ct, Action<long, long>? onProgress = null)
+        long inMemThreshold, CancellationToken ct, Action<long, long, long>? onProgress = null)
     {
         // aria2c always writes to disk — honour that and skip the in-memory path.
-        bool canUseAria2c = _hasAria2c && (knownSize == 0 || knownSize >= Aria2cSizeThreshold);
+        bool canUseAria2c = _aria2c != null && (inMemThreshold <= 0 || knownSize == 0 || knownSize > inMemThreshold);
 
         if (inMemThreshold <= 0 || (knownSize > 0 && knownSize > inMemThreshold) || canUseAria2c)
         {
@@ -183,7 +244,7 @@ public sealed class MinervaWorkerService
             {
                 await fsDirect.WriteAsync(bufD.AsMemory(0, rD), ct);
                 rxD += rD;
-                onProgress?.Invoke(rxD, total);
+                onProgress?.Invoke(rxD, total, 0);
             }
             return (null, fallbackLocalPath);
         }
@@ -199,7 +260,7 @@ public sealed class MinervaWorkerService
         while ((read = await stream.ReadAsync(buf, ct)) > 0)
         {
             received += read;
-            onProgress?.Invoke(received, total);
+            onProgress?.Invoke(received, total, 0);
 
             if (spill is null && received <= inMemThreshold)
             {
@@ -421,6 +482,7 @@ public sealed class MinervaWorkerService
         var localPath = LocalPathForJob(settings.TempDir, url, destPath);
         Exception? lastErr = null;
         bool uploaded = false;
+        bool fileReady = false;   // true once download has succeeded; skip re-download on upload retries
         long fileSize = 0;
         byte[]? inMemData = null;
 
@@ -428,27 +490,35 @@ public sealed class MinervaWorkerService
         {
             try
             {
-                UI(() =>
+                UI(() => { vm.CurrentAttempt = attempt; });
+
+                // ── Download phase (skipped on upload retries) ──────────────────────
+                if (!fileReady)
                 {
-                    vm.CurrentAttempt = attempt;
-                    vm.Status = JobStatus.Downloading;
-                    vm.BytesTransferred = 0;
-                    vm.TotalBytes = knownSize;
-                    vm.ResetSpeed();
-                });
+                    UI(() =>
+                    {
+                        vm.Status = JobStatus.Downloading;
+                        vm.BytesTransferred = 0;
+                        vm.TotalBytes = knownSize;
+                        vm.ResetSpeed();
+                    });
 
-                Action<long, long> dlProgress = (rx, total) => UI(() =>
-                {
-                    vm.BytesTransferred = rx;
-                    if (total > 0) vm.TotalBytes = total;
-                    vm.UpdateSpeed(rx);
-                });
+                    Action<long, long, long> dlProgress = (rx, total, speedBps) => UI(() =>
+                    {
+                        vm.BytesTransferred = rx;
+                        if (total > 0) vm.TotalBytes = total;
+                        if (speedBps > 0) vm.ForceSetSpeed(speedBps);
+                        else vm.UpdateSpeed(rx);
+                    });
 
-                (inMemData, _) = await DownloadSmartAsync(url, localPath,
-                    settings.Aria2cConnections, knownSize,
-                    settings.InMemoryThresholdBytes, ct, dlProgress);
-                fileSize = inMemData is not null ? inMemData.LongLength : new FileInfo(localPath).Length;
+                    (inMemData, _) = await DownloadSmartAsync(url, localPath,
+                        settings.Aria2cConnections, knownSize,
+                        settings.InMemoryThresholdBytes, ct, dlProgress);
+                    fileSize = inMemData is not null ? inMemData.LongLength : new FileInfo(localPath).Length;
+                    fileReady = true;
+                }
 
+                // ── Upload phase ────────────────────────────────────────────────────
                 UI(() =>
                 {
                     vm.Status = JobStatus.Uploading;
@@ -494,7 +564,9 @@ public sealed class MinervaWorkerService
                 var msg = $"Attempt {attempt}/{MaxRetries}: {ExceptionSummary(ex)}";
                 log($"FAIL [{vm.Label}] {msg}");
                 UI(() => { vm.ErrorMessage = msg; vm.SpeedText = ""; });
-                if (inMemData is null && File.Exists(localPath)) File.Delete(localPath);
+                // Only discard the local file if the download itself failed (partial write).
+                // If the download succeeded but the upload failed, keep the file for the next attempt.
+                if (!fileReady && inMemData is null && File.Exists(localPath)) File.Delete(localPath);
                 if (attempt < MaxRetries)
                 {
                     UI(() => { vm.CurrentAttempt = attempt; vm.Status = JobStatus.Retrying; });
@@ -527,7 +599,8 @@ public sealed class MinervaWorkerService
         var channel = Channel.CreateBounded<JsonElement>(
             new BoundedChannelOptions(settings.Concurrency * 2) { FullMode = BoundedChannelFullMode.Wait });
 
-        log($"Starting — concurrency={settings.Concurrency}, aria2c={_hasAria2c}");
+        bool aria2cOk = await TryStartAria2cDaemonAsync(settings.Aria2cConnections, settings.AutoInstallAria2c, log, ct);
+        log($"Starting — concurrency={settings.Concurrency}, aria2c={aria2cOk}");
 
         // Producer
         var producer = Task.Run(async () =>
@@ -601,6 +674,7 @@ public sealed class MinervaWorkerService
         }
 
         await Task.WhenAll(workerTasks);
+        StopAria2cDaemon();
         log("Worker stopped.");
     }
 }

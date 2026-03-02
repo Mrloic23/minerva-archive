@@ -166,6 +166,10 @@
                                    Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
                         <NumericUpDown Classes="Setting" Value="{Binding Aria2cConnections}"
                                        Minimum="1" Maximum="64" Increment="1"/>
+                        <CheckBox Content="Auto-install aria2c if missing"
+                                  IsChecked="{Binding AutoInstallAria2c}"
+                                  Margin="0 6 0 0"
+                                  ToolTip.Tip="Download aria2c automatically on first run if it is not installed. Disable if you prefer to manage aria2c yourself."/>
                     </StackPanel>
 
                     <!-- Storage -->
