@@ -39,6 +39,15 @@ public partial class JobProgressViewModel : ObservableObject
 
     public double Progress => TotalBytes > 0 ? (double)BytesTransferred / TotalBytes * 100 : 0;
 
+    public string TotalSizeText => TotalBytes > 0 ? FormatSize(TotalBytes) : "";
+    public string TransferText =>
+        (BytesTransferred > 0, TotalBytes > 0) switch
+        {
+            (true,  true)  => $"{FormatSize(BytesTransferred)} / {FormatSize(TotalBytes)}",
+            (true,  false) => $"{FormatSize(BytesTransferred)} / ?",
+            _              => "",
+        };
+
     public bool HasError => !string.IsNullOrEmpty(ErrorMessage) &&
                             (Status is JobStatus.Failed or JobStatus.Retrying);
     public bool IsActive => Status is JobStatus.Downloading or JobStatus.Uploading;
@@ -69,6 +78,14 @@ public partial class JobProgressViewModel : ObservableObject
         SpeedText = "";
     }
 
+    private static string FormatSize(long bytes) => bytes switch
+    {
+        >= 1_073_741_824 => $"{bytes / 1_073_741_824.0:F1} GB",
+        >= 1_048_576     => $"{bytes / 1_048_576.0:F1} MB",
+        >= 1_024         => $"{bytes / 1_024.0:F0} KB",
+        _                => $"{bytes} B",
+    };
+
     private static string FormatSpeed(double bps) => bps switch
     {
         >= 1_073_741_824 => $"{bps / 1_073_741_824:F1} GB/s",
@@ -87,8 +104,18 @@ public partial class JobProgressViewModel : ObservableObject
         OnPropertyChanged(nameof(IsNormal));
     }
 
-    partial void OnBytesTransferredChanged(long value) => OnPropertyChanged(nameof(Progress));
-    partial void OnTotalBytesChanged(long value) => OnPropertyChanged(nameof(Progress));
+    partial void OnBytesTransferredChanged(long value)
+    {
+        OnPropertyChanged(nameof(Progress));
+        OnPropertyChanged(nameof(TransferText));
+    }
+
+    partial void OnTotalBytesChanged(long value)
+    {
+        OnPropertyChanged(nameof(Progress));
+        OnPropertyChanged(nameof(TotalSizeText));
+        OnPropertyChanged(nameof(TransferText));
+    }
     partial void OnErrorMessageChanged(string value) => OnPropertyChanged(nameof(HasError));
     partial void OnCurrentAttemptChanged(int value) => OnPropertyChanged(nameof(StatusText));
 }

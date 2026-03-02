@@ -215,7 +215,7 @@
                                         <Border Margin="0 0 0 6" Padding="12 10"
                                                 CornerRadius="6"
                                                 Background="{DynamicResource SystemControlBackgroundChromeMediumLowBrush}">
-                                            <Grid RowDefinitions="Auto,5,Auto,Auto" ColumnDefinitions="*,Auto,Auto">
+                                            <Grid RowDefinitions="Auto,5,Auto,Auto,Auto" ColumnDefinitions="*,Auto,Auto">
 
                                                 <!-- filename -->
                                                 <TextBlock Grid.Row="0" Grid.Column="0"
@@ -265,8 +265,17 @@
                                                              Minimum="0" Maximum="100" Height="5"
                                                              Margin="0 2 0 0"/>
 
-                                                <!-- error detail (shown on retrying + failed) -->
+                                                <!-- transfer size (e.g. 245 MB / 1.2 GB) -->
                                                 <TextBlock Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="3"
+                                                           Text="{Binding TransferText}"
+                                                           FontSize="11"
+                                                           FontFamily="Consolas,Menlo,monospace"
+                                                           Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                                           Margin="0 3 0 0"
+                                                           IsVisible="{Binding TransferText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
+
+                                                <!-- error detail (shown on retrying + failed) -->
+                                                <TextBlock Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="3"
                                                            Text="{Binding ErrorMessage}"
                                                            FontSize="11"
                                                            FontFamily="Consolas,Menlo,monospace"

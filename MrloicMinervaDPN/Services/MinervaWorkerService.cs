@@ -120,7 +120,7 @@ public sealed class MinervaWorkerService
             };
             using var proc = Process.Start(psi) ?? throw new InvalidOperationException("Failed to start aria2c");
             // Poll written bytes for progress while aria2c runs (best-effort)
-            if (onProgress != null && knownSize > 0)
+            if (onProgress != null)
             {
                 _ = Task.Run(async () =>
                 {
@@ -159,27 +159,94 @@ public sealed class MinervaWorkerService
         }
     }
 
-    /// <summary>Downloads a URL fully into memory and returns the bytes.
-    /// Only used when the file is below <see cref="WorkerSettings.InMemoryThresholdBytes"/>.</summary>
-    private static async Task<byte[]> DownloadToMemoryAsync(string url, long knownSize,
-        CancellationToken ct, Action<long, long>? onProgress = null)
+    /// <summary>
+    /// Downloads <paramref name="url"/> into memory when the content fits within
+    /// <paramref name="inMemThreshold"/>, or streams to <paramref name="fallbackLocalPath"/> otherwise.
+    /// Returns <c>(memData, null)</c> for an in-memory result, or <c>(null, fallbackLocalPath)</c>
+    /// when the file was written to disk.
+    /// </summary>
+    private async Task<(byte[]? memData, string? localPath)> DownloadSmartAsync(
+        string url, string fallbackLocalPath, int aria2cConns, long knownSize,
+        long inMemThreshold, CancellationToken ct, Action<long, long>? onProgress = null)
     {
+        // aria2c always writes to disk — honour that and skip the in-memory path.
+        bool canUseAria2c = _hasAria2c && (knownSize == 0 || knownSize >= Aria2cSizeThreshold);
+
+        if (inMemThreshold <= 0 || (knownSize > 0 && knownSize > inMemThreshold) || canUseAria2c)
+        {
+            await DownloadFileAsync(url, fallbackLocalPath, aria2cConns, knownSize, ct, onProgress);
+            return (null, fallbackLocalPath);
+        }
+
+        // Open the HTTP response so we can inspect Content-Length before committing.
         using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(300) };
         using var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, ct);
         resp.EnsureSuccessStatusCode();
-        var total = resp.Content.Headers.ContentLength ?? knownSize;
-        var ms = knownSize > 0 ? new MemoryStream((int)knownSize) : new MemoryStream();
+
+        var contentLength = resp.Content.Headers.ContentLength;
+        long total = contentLength ?? knownSize;
+
+        // Content-Length is known and exceeds threshold — stream directly to disk.
+        if (contentLength.HasValue && contentLength.Value > inMemThreshold)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(fallbackLocalPath)!);
+            await using var fsDirect = new FileStream(fallbackLocalPath, FileMode.Create,
+                FileAccess.Write, FileShare.None, 1 << 20, true);
+            var bufD = new byte[1 << 20];
+            long rxD = 0;
+            await using var stD = await resp.Content.ReadAsStreamAsync(ct);
+            int rD;
+            while ((rD = await stD.ReadAsync(bufD, ct)) > 0)
+            {
+                await fsDirect.WriteAsync(bufD.AsMemory(0, rD), ct);
+                rxD += rD;
+                onProgress?.Invoke(rxD, total);
+            }
+            return (null, fallbackLocalPath);
+        }
+
+        // Stream into memory; if we exceed the threshold mid-download, spill buffered
+        // bytes to disk transparently so the caller never needs to retry the download.
+        var ms = new MemoryStream(total > 0 ? (int)Math.Min(total, inMemThreshold) : 64 * 1024);
+        FileStream? spill = null;
         var buf = new byte[1 << 20];
         long received = 0;
         await using var stream = await resp.Content.ReadAsStreamAsync(ct);
         int read;
         while ((read = await stream.ReadAsync(buf, ct)) > 0)
         {
-            await ms.WriteAsync(buf.AsMemory(0, read), ct);
             received += read;
             onProgress?.Invoke(received, total);
+
+            if (spill is null && received <= inMemThreshold)
+            {
+                await ms.WriteAsync(buf.AsMemory(0, read), ct);
+            }
+            else if (spill is null)
+            {
+                // Exceeded the threshold — flush the in-memory buffer to disk and continue there.
+                Directory.CreateDirectory(Path.GetDirectoryName(fallbackLocalPath)!);
+                spill = new FileStream(fallbackLocalPath, FileMode.Create, FileAccess.Write,
+                    FileShare.None, 1 << 20, true);
+                ms.Position = 0;
+                await ms.CopyToAsync(spill, ct);
+                ms.Dispose();
+                await spill.WriteAsync(buf.AsMemory(0, read), ct);
+            }
+            else
+            {
+                await spill.WriteAsync(buf.AsMemory(0, read), ct);
+            }
         }
-        return ms.ToArray();
+
+        if (spill is not null)
+        {
+            await spill.FlushAsync(ct);
+            await spill.DisposeAsync();
+            return (null, fallbackLocalPath);
+        }
+
+        return (ms.ToArray(), null);
     }
 
     private async Task UploadStreamAsync(
@@ -353,16 +420,13 @@ public sealed class MinervaWorkerService
             vm.Status = JobStatus.Downloading;
         });
 
-        // Files that fit within the threshold are kept entirely in RAM.
-        // aria2c always writes to disk, so in-memory only applies to HTTP downloads.
-        bool useInMemory = settings.InMemoryThresholdBytes > 0
-            && knownSize > 0
-            && knownSize <= settings.InMemoryThresholdBytes;
-
-        var localPath = useInMemory ? null : LocalPathForJob(settings.TempDir, url, destPath);
+        // Always compute a local path as the disk fallback. DownloadSmartAsync will decide
+        // at download time (using Content-Length) whether to use memory or disk.
+        var localPath = LocalPathForJob(settings.TempDir, url, destPath);
         Exception? lastErr = null;
         bool uploaded = false;
         long fileSize = 0;
+        byte[]? inMemData = null;
 
         for (int attempt = 1; attempt <= MaxRetries && !ct.IsCancellationRequested; attempt++)
         {
@@ -384,17 +448,10 @@ public sealed class MinervaWorkerService
                     vm.UpdateSpeed(rx);
                 });
 
-                byte[]? inMemData = null;
-                if (useInMemory)
-                {
-                    inMemData = await DownloadToMemoryAsync(url, knownSize, ct, dlProgress);
-                    fileSize = inMemData.LongLength;
-                }
-                else
-                {
-                    await DownloadFileAsync(url, localPath!, settings.Aria2cConnections, knownSize, ct, dlProgress);
-                    fileSize = new FileInfo(localPath!).Length;
-                }
+                (inMemData, _) = await DownloadSmartAsync(url, localPath,
+                    settings.Aria2cConnections, knownSize,
+                    settings.InMemoryThresholdBytes, ct, dlProgress);
+                fileSize = inMemData is not null ? inMemData.LongLength : new FileInfo(localPath).Length;
 
                 UI(() =>
                 {
@@ -411,14 +468,14 @@ public sealed class MinervaWorkerService
                     vm.UpdateSpeed(s);
                 });
 
-                if (useInMemory)
+                if (inMemData is not null)
                 {
-                    using var ms = new MemoryStream(inMemData!);
+                    using var ms = new MemoryStream(inMemData);
                     await UploadStreamAsync(settings.UploadServerUrl, token, fileId, ms, fileSize, ulProgress, ct);
                 }
                 else
                 {
-                    await using var fs = new FileStream(localPath!, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, true);
+                    await using var fs = new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, true);
                     await UploadStreamAsync(settings.UploadServerUrl, token, fileId, fs, fileSize, ulProgress, ct);
                 }
 
@@ -430,7 +487,7 @@ public sealed class MinervaWorkerService
                 lastErr = ex;
                 var msg = $"Attempt {attempt}/{MaxRetries}: {ex.Message.Split('\n')[0].Trim()}";
                 UI(() => { vm.ErrorMessage = msg; vm.SpeedText = ""; });
-                if (!useInMemory && localPath != null && File.Exists(localPath)) File.Delete(localPath);
+                if (inMemData is null && File.Exists(localPath)) File.Delete(localPath);
                 if (attempt < MaxRetries)
                 {
                     UI(() => { vm.CurrentAttempt = attempt; vm.Status = JobStatus.Retrying; });
@@ -448,7 +505,7 @@ public sealed class MinervaWorkerService
         }
 
         UI(() => { vm.Status = JobStatus.Done; vm.BytesTransferred = fileSize; vm.SpeedText = ""; });
-        if (!useInMemory && !settings.KeepFiles && localPath != null && File.Exists(localPath)) File.Delete(localPath);
+        if (inMemData is null && !settings.KeepFiles && File.Exists(localPath)) File.Delete(localPath);
 
         try { await ReportJobAsync(settings.ServerUrl, token, fileId, "completed", bytesDownloaded: fileSize, ct: ct); }
         catch { /* best-effort */ }
