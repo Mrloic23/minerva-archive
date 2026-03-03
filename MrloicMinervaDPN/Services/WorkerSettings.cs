@@ -7,9 +7,10 @@ public sealed class WorkerSettings
 {
     public string ServerUrl { get; set; } = "https://api.minerva-archive.org";
     public string UploadServerUrl { get; set; } = "https://gate.minerva-archive.org";
-    public int Concurrency { get; set; } = 2;
-    public int BatchSize { get; set; } = 10;
-    public int Aria2cConnections { get; set; } = 8;
+    public int Concurrency { get; set; } = 4;
+    public int UploadConcurrency { get; set; } = 4;
+    public int BatchSize { get; set; } = 6;
+    public int Aria2cConnections { get; set; } = 16;
     /// <summary>When true, aria2c is automatically downloaded on first run if not found in PATH.</summary>
     public bool AutoInstallAria2c { get; set; } = true;
     public string TempDir { get; set; } = Path.Combine(

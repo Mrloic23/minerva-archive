@@ -40,7 +40,7 @@ public sealed class MinervaWorkerService
         return port;
     }
 
-    private async Task<bool> TryStartAria2cDaemonAsync(int conns, bool autoInstall, Action<string> log, CancellationToken ct)
+    private async Task<bool> TryStartAria2cDaemonAsync(int maxConcurrent, int conns, bool autoInstall, Action<string> log, CancellationToken ct)
     {
         var aria2cPath = await Aria2cInstaller.EnsureAsync(log, autoInstall, ct);
         if (aria2cPath is null) return false;
@@ -59,6 +59,7 @@ public sealed class MinervaWorkerService
         psi.ArgumentList.Add($"--rpc-secret={_aria2cSecret}");
         psi.ArgumentList.Add("--rpc-listen-all=false");
         psi.ArgumentList.Add("--quiet=true");
+        psi.ArgumentList.Add($"--max-concurrent-downloads={maxConcurrent}");
         psi.ArgumentList.Add($"--max-connection-per-server={conns}");
         psi.ArgumentList.Add($"--split={conns}");
         psi.ArgumentList.Add("--auto-file-renaming=false");
@@ -83,27 +84,15 @@ public sealed class MinervaWorkerService
 
     private void StopAria2cDaemon()
     {
-        var client = _aria2c;
         _aria2c = null;
-        // Fire-and-forget the RPC shutdown; then give the process a moment to exit on its own.
-        try { client?.ShutdownAsync().GetAwaiter().GetResult(); } catch { }
-        if (_aria2cProc is { HasExited: false })
-        {
-            try { if (!_aria2cProc.WaitForExit(2000)) _aria2cProc.Kill(); }
-            catch { }
-        }
+        var proc = _aria2cProc;
         _aria2cProc = null;
+        if (proc is { HasExited: false })
+            try { proc.Kill(); } catch { }
     }
 
-    /// <summary>Cancels any running work and asynchronously kills the aria2c daemon.
-    /// Safe to call more than once and from any thread.</summary>
-    public Task StopAsync()
-    {
-        _aria2c = null;  // prevent new submissions
-        return Task.Run(StopAria2cDaemon);
-    }
-
-    public void Stop() => StopAria2cDaemon();
+    /// <summary>Kills the aria2c daemon. Safe to call from any thread.</summary>
+    public Task StopAsync() { StopAria2cDaemon(); return Task.CompletedTask; }
 
     private static void AddWorkerHeaders(HttpClient client, string token)
     {
@@ -218,10 +207,9 @@ public sealed class MinervaWorkerService
         string url, string fallbackLocalPath, int aria2cConns, long knownSize,
         long inMemThreshold, CancellationToken ct, Action<long, long, long>? onProgress = null)
     {
-        // aria2c always writes to disk — honour that and skip the in-memory path.
-        bool canUseAria2c = _aria2c != null && (inMemThreshold <= 0 || knownSize == 0 || knownSize > inMemThreshold);
-
-        if (inMemThreshold <= 0 || (knownSize > 0 && knownSize > inMemThreshold) || canUseAria2c)
+        // aria2c always writes to disk — use the disk path when aria2c is running,
+        // the threshold is disabled, or the file is known to exceed the threshold.
+        if (_aria2c != null || inMemThreshold <= 0 || (knownSize > 0 && knownSize > inMemThreshold))
         {
             await DownloadFileAsync(url, fallbackLocalPath, aria2cConns, knownSize, ct, onProgress);
             return (null, fallbackLocalPath);
@@ -463,18 +451,30 @@ public sealed class MinervaWorkerService
         return $"Failed after {totalAttempts} attempt{(totalAttempts != 1 ? "s" : "")}: {ExceptionSummary(ex)}";
     }
 
-    private async Task ProcessJobAsync(WorkerSettings settings, string token,
-        JobProgressViewModel vm, JsonElement job, Action<string> log, CancellationToken ct,
-        Action<long>? onSuccess = null, Action? onFail = null)
+    /// <summary>Payload passed from a download worker to an upload worker.</summary>
+    private sealed record DownloadedJob(
+        WorkerSettings Settings, string Token, JobProgressViewModel Vm, JsonElement Job,
+        byte[]? InMemData, string? LocalPath, long FileSize,
+        Action<string> Log, Action<long>? OnSuccess, Action? OnFail);
+
+    /// <summary>
+    /// Download phase: retries up to MaxRetries times.
+    /// On success writes to <paramref name="uploadWriter"/> and returns true.
+    /// On total failure reports to the server and returns false.
+    /// </summary>
+    private async Task<bool> DownloadPhaseAsync(
+        WorkerSettings settings, string token, JobProgressViewModel vm, JsonElement job,
+        Action<string> log, CancellationToken ct,
+        ChannelWriter<DownloadedJob> uploadWriter,
+        Action<long>? onSuccess, Action? onFail)
     {
-        var fileId = job.GetProperty("file_id").GetInt32();
-        var url = job.GetProperty("url").GetString()!;
+        var fileId   = job.GetProperty("file_id").GetInt32();
+        var url      = job.GetProperty("url").GetString()!;
         var destPath = job.GetProperty("dest_path").GetString()!;
         long knownSize = job.TryGetProperty("size", out var sz) && sz.ValueKind != JsonValueKind.Null
             ? sz.GetInt64() : 0;
 
-        void UI(Action a) => Avalonia.Threading.Dispatcher.UIThread.Post(a);
-
+        static void UI(Action a) => Avalonia.Threading.Dispatcher.UIThread.Post(a);
         UI(() =>
         {
             var decoded = Uri.UnescapeDataString(destPath);
@@ -483,61 +483,96 @@ public sealed class MinervaWorkerService
             vm.Status = JobStatus.Downloading;
         });
 
-        // Always compute a local path as the disk fallback. DownloadSmartAsync will decide
-        // at download time (using Content-Length) whether to use memory or disk.
         var localPath = LocalPathForJob(settings.TempDir, url, destPath);
         Exception? lastErr = null;
-        bool uploaded = false;
-        bool fileReady = false;   // true once download has succeeded; skip re-download on upload retries
-        long fileSize = 0;
-        byte[]? inMemData = null;
 
         for (int attempt = 1; attempt <= MaxRetries && !ct.IsCancellationRequested; attempt++)
         {
             try
             {
-                UI(() => { vm.CurrentAttempt = attempt; });
-
-                // ── Download phase (skipped on upload retries) ──────────────────────
-                if (!fileReady)
-                {
-                    UI(() =>
-                    {
-                        vm.Status = JobStatus.Downloading;
-                        vm.BytesTransferred = 0;
-                        vm.TotalBytes = knownSize;
-                        vm.ResetSpeed();
-                    });
-
-                    Action<long, long, long> dlProgress = (rx, total, speedBps) => UI(() =>
-                    {
-                        vm.BytesTransferred = rx;
-                        if (total > 0) vm.TotalBytes = total;
-                        if (speedBps > 0) vm.ForceSetSpeed(speedBps);
-                        else vm.UpdateSpeed(rx);
-                    });
-
-                    (inMemData, _) = await DownloadSmartAsync(url, localPath,
-                        settings.Aria2cConnections, knownSize,
-                        settings.InMemoryThresholdBytes, ct, dlProgress);
-                    fileSize = inMemData is not null ? inMemData.LongLength : new FileInfo(localPath).Length;
-                    fileReady = true;
-                }
-
-                // ── Upload phase ────────────────────────────────────────────────────
                 UI(() =>
                 {
+                    vm.CurrentAttempt = attempt;
+                    vm.Status = JobStatus.Downloading;
+                    vm.BytesTransferred = 0;
+                    vm.TotalBytes = knownSize;
+                    vm.ResetSpeed();
+                });
+
+                Action<long, long, long> dlProgress = (rx, total, speedBps) => UI(() =>
+                {
+                    vm.BytesTransferred = rx;
+                    if (total > 0) vm.TotalBytes = total;
+                    if (speedBps > 0) vm.ForceSetSpeed(speedBps); else vm.UpdateSpeed(rx);
+                });
+
+                var (inMemData, _) = await DownloadSmartAsync(url, localPath,
+                    settings.Aria2cConnections, knownSize,
+                    settings.InMemoryThresholdBytes, ct, dlProgress);
+
+                long fileSize = inMemData is not null ? inMemData.LongLength : new FileInfo(localPath).Length;
+
+                await uploadWriter.WriteAsync(
+                    new DownloadedJob(settings, token, vm, job,
+                        inMemData, inMemData is null ? localPath : null,
+                        fileSize, log, onSuccess, onFail), CancellationToken.None);
+                return true;
+            }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
+            {
+                lastErr = ex;
+                var msg = $"Download attempt {attempt}/{MaxRetries}: {ExceptionSummary(ex)}";
+                log($"DL-FAIL [{vm.Label}] {msg}");
+                UI(() => { vm.ErrorMessage = msg; vm.SpeedText = ""; });
+                if (File.Exists(localPath)) try { File.Delete(localPath); } catch { }
+                if (attempt < MaxRetries)
+                {
+                    UI(() => { vm.Status = JobStatus.Retrying; });
+                    await Task.Delay(TimeSpan.FromSeconds(RetryDelaySeconds * attempt), ct);
+                }
+            }
+        }
+
+        var errMsg = BuildErrorMessage(lastErr, MaxRetries);
+        log($"DL-FAIL [{vm.Label}] {errMsg}");
+        UI(() => { vm.Status = JobStatus.Failed; vm.SpeedText = ""; vm.ErrorMessage = errMsg; });
+        try { await ReportJobAsync(settings.ServerUrl, token, fileId, "failed", error: errMsg, ct: ct); } catch { }
+        onFail?.Invoke();
+        return false;
+    }
+
+    /// <summary>
+    /// Upload phase: retries up to MaxRetries times, then reports result to the server.
+    /// </summary>
+    private async Task UploadPhaseAsync(DownloadedJob dl, CancellationToken ct)
+    {
+        var (settings, token, vm, job, inMemData, localPath, fileSize, log, onSuccess, onFail) = dl;
+        var fileId = job.GetProperty("file_id").GetInt32();
+        void UI(Action a) => Avalonia.Threading.Dispatcher.UIThread.Post(a);
+        Exception? lastErr = null;
+
+        // The loop guard intentionally omits a ct check so that already-downloaded files
+        // always get an upload attempt even when the worker is stopping.
+        // Individual HTTP calls and retry delays still honour ct.
+        for (int attempt = 1; attempt <= MaxRetries; attempt++)
+        {
+            try
+            {
+                UI(() =>
+                {
+                    vm.CurrentAttempt = attempt;
                     vm.Status = JobStatus.Uploading;
                     vm.BytesTransferred = 0;
                     vm.TotalBytes = fileSize;
                     vm.ResetSpeed();
                 });
 
-                var ulThrottle = Stopwatch.StartNew();
-                Action<long, long> ulProgressTracked = (s, t) =>
+                log($"Uploading [{vm.Label}] attempt {attempt}/{MaxRetries}…");
+
+                Action<long, long> ulProgress = (s, t) =>
                 {
-                    if (ulThrottle.Elapsed.TotalMilliseconds < 200) return;
-                    ulThrottle.Restart();
+                    // Let UpdateSpeed's internal gate rate-limit; just post every call.
                     UI(() =>
                     {
                         vm.BytesTransferred = s;
@@ -549,51 +584,44 @@ public sealed class MinervaWorkerService
                 if (inMemData is not null)
                 {
                     using var ms = new MemoryStream(inMemData);
-                    await UploadStreamAsync(settings.UploadServerUrl, token, fileId, ms, fileSize, ulProgressTracked, ct);
+                    await UploadStreamAsync(settings.UploadServerUrl, token, fileId, ms, fileSize, ulProgress, ct);
                 }
                 else
                 {
-                    await using var fs = new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, true);
-                    await UploadStreamAsync(settings.UploadServerUrl, token, fileId, fs, fileSize, ulProgressTracked, ct);
+                    await using var fs = new FileStream(localPath!, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, true);
+                    await UploadStreamAsync(settings.UploadServerUrl, token, fileId, fs, fileSize, ulProgress, ct);
                 }
 
-                uploaded = true;
-                break;
+                UI(() => { vm.Status = JobStatus.Done; vm.BytesTransferred = fileSize; vm.SpeedText = ""; });
+                if (inMemData is null && !settings.KeepFiles && localPath != null && File.Exists(localPath))
+                    File.Delete(localPath);
+                onSuccess?.Invoke(fileSize);
+                log($"OK (upload) [{vm.Label}]");
+                try { await ReportJobAsync(settings.ServerUrl, token, fileId, "completed", bytesDownloaded: fileSize, ct: CancellationToken.None); } catch { }
+                return;
             }
-            catch (Exception ex) when (!ct.IsCancellationRequested)
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex)
             {
                 lastErr = ex;
-                var msg = $"Attempt {attempt}/{MaxRetries}: {ExceptionSummary(ex)}";
-                log($"FAIL [{vm.Label}] {msg}");
+                var msg = $"Upload attempt {attempt}/{MaxRetries}: {ExceptionSummary(ex)}";
+                log($"UL-FAIL [{vm.Label}] {msg}");
                 UI(() => { vm.ErrorMessage = msg; vm.SpeedText = ""; });
-                // Only discard the local file if the download itself failed (partial write).
-                // If the download succeeded but the upload failed, keep the file for the next attempt.
-                if (!fileReady && inMemData is null && File.Exists(localPath)) File.Delete(localPath);
                 if (attempt < MaxRetries)
                 {
-                    UI(() => { vm.CurrentAttempt = attempt; vm.Status = JobStatus.Retrying; });
+                    UI(() => { vm.Status = JobStatus.Retrying; });
                     await Task.Delay(TimeSpan.FromSeconds(RetryDelaySeconds * attempt), ct);
                 }
             }
         }
 
-        if (!uploaded)
-        {
-            if (inMemData is null && File.Exists(localPath)) try { File.Delete(localPath); } catch { }
-            var errMsg = BuildErrorMessage(lastErr, MaxRetries);
-            log($"FAIL [{vm.Label}] {errMsg}");
-            UI(() => { vm.Status = JobStatus.Failed; vm.SpeedText = ""; vm.ErrorMessage = errMsg; });
-            try { await ReportJobAsync(settings.ServerUrl, token, fileId, "failed", error: errMsg, ct: ct); } catch { }
-            onFail?.Invoke();
-            return;
-        }
-
-        UI(() => { vm.Status = JobStatus.Done; vm.BytesTransferred = fileSize; vm.SpeedText = ""; });
-        if (inMemData is null && !settings.KeepFiles && File.Exists(localPath)) File.Delete(localPath);
-        onSuccess?.Invoke(fileSize);
-
-        try { await ReportJobAsync(settings.ServerUrl, token, fileId, "completed", bytesDownloaded: fileSize, ct: ct); }
-        catch { /* best-effort */ }
+        if (inMemData is null && localPath != null && File.Exists(localPath))
+            try { File.Delete(localPath); } catch { }
+        var errMsg = BuildErrorMessage(lastErr, MaxRetries);
+        log($"UL-FAIL [{vm.Label}] {errMsg}");
+        UI(() => { vm.Status = JobStatus.Failed; vm.SpeedText = ""; vm.ErrorMessage = errMsg; });
+        try { await ReportJobAsync(settings.ServerUrl, token, fileId, "failed", error: errMsg, ct: ct); } catch { }
+        onFail?.Invoke();
     }
 
     public async Task RunAsync(WorkerSettings settings, string token,
@@ -602,13 +630,22 @@ public sealed class MinervaWorkerService
     {
         Directory.CreateDirectory(settings.TempDir);
         var seen = new ConcurrentDictionary<int, byte>();
-        var channel = Channel.CreateBounded<JsonElement>(
+
+        // Channel 1: raw jobs from the API → download workers
+        var jobChannel = Channel.CreateBounded<JsonElement>(
             new BoundedChannelOptions(settings.Concurrency * 2) { FullMode = BoundedChannelFullMode.Wait });
 
-        bool aria2cOk = await TryStartAria2cDaemonAsync(settings.Aria2cConnections, settings.AutoInstallAria2c, log, ct);
-        log($"Starting — concurrency={settings.Concurrency}, aria2c={aria2cOk}");
+        // Channel 2: downloaded jobs → upload workers
+        // Capacity must be at least the download pool size so finished downloads never
+        // block waiting for an upload slot, which would stall the download concurrency.
+        var uploadChannel = Channel.CreateBounded<DownloadedJob>(
+            new BoundedChannelOptions(Math.Max(settings.Concurrency, settings.UploadConcurrency * 2))
+                { FullMode = BoundedChannelFullMode.Wait });
 
-        // Producer
+        bool aria2cOk = await TryStartAria2cDaemonAsync(settings.Concurrency, settings.Aria2cConnections, settings.AutoInstallAria2c, log, ct);
+        log($"Starting — download={settings.Concurrency}, upload={settings.UploadConcurrency}, aria2c={aria2cOk}");
+
+        // Producer: fetch jobs from the API and push into jobChannel
         var producer = Task.Run(async () =>
         {
             using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
@@ -620,7 +657,7 @@ public sealed class MinervaWorkerService
                 try
                 {
                     var resp = await client.GetAsync(
-                        $"{settings.ServerUrl}/api/jobs?count={Math.Min(4, settings.BatchSize)}", ct);
+                        $"{settings.ServerUrl}/api/jobs?count={settings.BatchSize}", ct);
                     if ((int)resp.StatusCode == 401) { log("Token expired. Log in again."); break; }
                     resp.EnsureSuccessStatusCode();
                     using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
@@ -637,7 +674,7 @@ public sealed class MinervaWorkerService
                     {
                         var fid = job.GetProperty("file_id").GetInt32();
                         if (!seen.TryAdd(fid, 0)) continue;
-                        await channel.Writer.WriteAsync(job.Clone(), ct);
+                        await jobChannel.Writer.WriteAsync(job.Clone(), ct);
                     }
                 }
                 catch (OperationCanceledException) { break; }
@@ -647,39 +684,69 @@ public sealed class MinervaWorkerService
                     await Task.Delay(TimeSpan.FromSeconds(6 + Random.Shared.NextDouble() * 4), ct);
                 }
             }
-            channel.Writer.TryComplete();
+            jobChannel.Writer.TryComplete();
         }, ct);
 
-        // Consumers
-        var sem = new SemaphoreSlim(settings.Concurrency);
-        var workerTasks = new List<Task>();
-
-        await foreach (var job in channel.Reader.ReadAllAsync(ct))
+        // Download workers: pull from jobChannel, download, push to uploadChannel
+        var downloadWorkers = new Task[settings.Concurrency];
+        for (int i = 0; i < settings.Concurrency; i++)
         {
-            await sem.WaitAsync(ct);
-            var vm = new JobProgressViewModel();
-            Avalonia.Threading.Dispatcher.UIThread.Post(() => ActiveJobs.Add(vm));
-            var captured = job;
-            var task = Task.Run(async () =>
+            downloadWorkers[i] = Task.Run(async () =>
             {
-                try
+                await foreach (var job in jobChannel.Reader.ReadAllAsync(ct))
                 {
-                    await ProcessJobAsync(settings, token, vm, captured, log, ct, onSuccess, onFail);
-                    log($"{(vm.Status == JobStatus.Done ? "OK" : "FAIL")} {vm.Label}");
+                    var vm = new JobProgressViewModel();
+                    Avalonia.Threading.Dispatcher.UIThread.Post(() => ActiveJobs.Add(vm));
+                    bool ok = false;
+                    try
+                    {
+                        ok = await DownloadPhaseAsync(settings, token, vm, job, log, ct,
+                            uploadChannel.Writer, onSuccess, onFail);
+                    }
+                    catch (OperationCanceledException) { }
+                    finally
+                    {
+                        if (!ok)
+                        {
+                            // Download failed entirely — clean up now; upload worker won't see this job.
+                            seen.TryRemove(job.GetProperty("file_id").GetInt32(), out _);
+                            if (!ct.IsCancellationRequested)
+                                await Task.Delay(TimeSpan.FromSeconds(3), CancellationToken.None);
+                            Avalonia.Threading.Dispatcher.UIThread.Post(() => ActiveJobs.Remove(vm));
+                        }
+                    }
                 }
-                finally
-                {
-                    sem.Release();
-                    seen.TryRemove(captured.GetProperty("file_id").GetInt32(), out _);
-                    if (vm.Status == JobStatus.Done)
-                        await Task.Delay(TimeSpan.FromSeconds(3), CancellationToken.None);
-                    Avalonia.Threading.Dispatcher.UIThread.Post(() => ActiveJobs.Remove(vm));
-                }
-            }, CancellationToken.None);
-            workerTasks.Add(task);
+            }, ct);
         }
 
-        await Task.WhenAll(workerTasks);
+        // Close the upload channel once all download workers are done
+        _ = Task.WhenAll(downloadWorkers).ContinueWith(_ => uploadChannel.Writer.TryComplete());
+
+        // Upload workers: pull from uploadChannel, upload, report
+        var uploadWorkers = new Task[settings.UploadConcurrency];
+        for (int i = 0; i < settings.UploadConcurrency; i++)
+        {
+            uploadWorkers[i] = Task.Run(async () =>
+            {
+                await foreach (var dl in uploadChannel.Reader.ReadAllAsync(CancellationToken.None))
+                {
+                    try { await UploadPhaseAsync(dl, ct); }
+                    catch (OperationCanceledException) { }
+                    catch (Exception ex) { log($"Upload worker error: {ex.Message}"); }
+                    finally
+                    {
+                        seen.TryRemove(dl.Job.GetProperty("file_id").GetInt32(), out _);
+                        if (dl.Vm.Status == JobStatus.Done && !ct.IsCancellationRequested)
+                            await Task.Delay(TimeSpan.FromSeconds(3), CancellationToken.None);
+                        Avalonia.Threading.Dispatcher.UIThread.Post(() => ActiveJobs.Remove(dl.Vm));
+                    }
+                }
+            }, ct);
+        }
+
+        try { await Task.WhenAll([producer, ..downloadWorkers, ..uploadWorkers]); }
+        catch (OperationCanceledException) { }
+
         StopAria2cDaemon();
         log("Worker stopped.");
     }

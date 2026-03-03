@@ -24,9 +24,10 @@ public partial class MainWindowViewModel : ViewModelBase
     // ── Settings ───────────────────────────────────────────────────────────
     [ObservableProperty] private string _serverUrl = "https://api.minerva-archive.org";
     [ObservableProperty] private string _uploadServerUrl = "https://gate.minerva-archive.org";
-    [ObservableProperty] private decimal _concurrency = 2;
-    [ObservableProperty] private decimal _batchSize = 10;
-    [ObservableProperty] private decimal _aria2cConnections = 8;
+    [ObservableProperty] private decimal _concurrency = 4;
+    [ObservableProperty] private decimal _uploadConcurrency = 4;
+    [ObservableProperty] private decimal _batchSize = 4;
+    [ObservableProperty] private decimal _aria2cConnections = 16;
     [ObservableProperty] private bool _autoInstallAria2c = true;
     [ObservableProperty] private string _tempDir = System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".minerva-dpn", "tmp");
@@ -39,6 +40,11 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private string _logText = "";
     [ObservableProperty] private string _downloadSpeedText = "";
     [ObservableProperty] private string _uploadSpeedText = "";
+
+    // ── Update check ───────────────────────────────────────────────────────
+    [ObservableProperty] private bool _updateAvailable;
+    [ObservableProperty] private string _latestVersion = "";
+    [ObservableProperty] private string _updateUrl = "";
 
     // ── Session counters ──────────────────────────────────────────────────
     [ObservableProperty] private int _filesUploaded;
@@ -56,6 +62,32 @@ public partial class MainWindowViewModel : ViewModelBase
     public MainWindowViewModel()
     {
         IsLoggedIn = TokenStore.Load() != null;
+        _ = StartUpdateCheckLoopAsync();
+    }
+
+    private async Task StartUpdateCheckLoopAsync()
+    {
+        await CheckForUpdateAsync();
+        using var timer = new PeriodicTimer(TimeSpan.FromMinutes(45));
+        while (await timer.WaitForNextTickAsync())
+            await CheckForUpdateAsync();
+    }
+
+    private async Task CheckForUpdateAsync()
+    {
+        try
+        {
+            var current = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version
+                          ?? new Version(0, 6, 0);
+            var info = await UpdateService.CheckAsync(current);
+            if (info.IsAvailable)
+            {
+                UpdateAvailable = true;
+                LatestVersion = info.LatestVersion;
+                UpdateUrl = info.HtmlUrl;
+            }
+        }
+        catch { /* silently ignore update-check failures */ }
     }
 
     // ── Commands ───────────────────────────────────────────────────────────
@@ -121,6 +153,7 @@ public partial class MainWindowViewModel : ViewModelBase
             ServerUrl = ServerUrl,
             UploadServerUrl = UploadServerUrl,
             Concurrency = (int)Concurrency,
+            UploadConcurrency = (int)UploadConcurrency,
             BatchSize = (int)BatchSize,
             Aria2cConnections = (int)Aria2cConnections,
             AutoInstallAria2c = AutoInstallAria2c,
@@ -191,6 +224,14 @@ public partial class MainWindowViewModel : ViewModelBase
 
     [RelayCommand]
     private void ClearLog() => LogText = "";
+
+    [RelayCommand]
+    private void OpenUpdateUrl()
+    {
+        if (string.IsNullOrEmpty(UpdateUrl)) return;
+        System.Diagnostics.Process.Start(
+            new System.Diagnostics.ProcessStartInfo(UpdateUrl) { UseShellExecute = true });
+    }
 
     partial void OnIsLoggedInChanged(bool value)
     {
