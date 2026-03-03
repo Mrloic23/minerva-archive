@@ -40,6 +40,17 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private string _downloadSpeedText = "";
     [ObservableProperty] private string _uploadSpeedText = "";
 
+    // ── Session counters ──────────────────────────────────────────────────
+    [ObservableProperty] private int _filesUploaded;
+    [ObservableProperty] private long _totalBytesUploaded;
+    [ObservableProperty] private int _filesFailed;
+
+    public bool HasSessionStats => FilesUploaded > 0 || FilesFailed > 0;
+    public bool HasFailedJobs   => FilesFailed > 0;
+    public string FilesUploadedText     => $"{FilesUploaded} file{(FilesUploaded != 1 ? "s" : "")} uploaded";
+    public string TotalBytesUploadedText => FormatSize(TotalBytesUploaded);
+    public string FilesFailedText       => $"{FilesFailed} failed";
+
     public ObservableCollection<JobProgressViewModel> ActiveJobs => _workerService.ActiveJobs;
 
     public MainWindowViewModel()
@@ -101,6 +112,9 @@ public partial class MainWindowViewModel : ViewModelBase
 
         _workerCts = new CancellationTokenSource();
         IsRunning = true;
+        FilesUploaded = 0;
+        TotalBytesUploaded = 0;
+        FilesFailed = 0;
 
         var settings = new WorkerSettings
         {
@@ -131,7 +145,13 @@ public partial class MainWindowViewModel : ViewModelBase
 
         try
         {
-            await _workerService.RunAsync(settings, token, AppendLog, _workerCts.Token);
+            await _workerService.RunAsync(settings, token, AppendLog, _workerCts.Token,
+                onSuccess: bytes => Dispatcher.UIThread.Post(() =>
+                {
+                    FilesUploaded++;
+                    TotalBytesUploaded += bytes;
+                }),
+                onFail: () => Dispatcher.UIThread.Post(() => FilesFailed++));
         }
         catch (OperationCanceledException)
         {
@@ -159,15 +179,15 @@ public partial class MainWindowViewModel : ViewModelBase
         _workerCts?.Cancel();
         AppendLog("Stopping worker...");
     }
-
-    /// <summary>Called when the main window is closing. Cancels the worker and stops the
-    /// aria2c daemon synchronously so the process does not linger after the app exits.</summary>
-    public void Shutdown()
+    public Task ShutdownAsync()
     {
         _loginCts?.Cancel();
         _workerCts?.Cancel();
-        _workerService.Stop();
+        return _workerService.StopAsync();
     }
+
+    // Keep the parameterless Shutdown for any callers that don't await.
+    public void Shutdown() => _ = ShutdownAsync();
 
     [RelayCommand]
     private void ClearLog() => LogText = "";
@@ -190,6 +210,32 @@ public partial class MainWindowViewModel : ViewModelBase
         StartWorkerCommand.NotifyCanExecuteChanged();
         StopWorkerCommand.NotifyCanExecuteChanged();
     }
+
+    partial void OnFilesUploadedChanged(int value)
+    {
+        OnPropertyChanged(nameof(HasSessionStats));
+        OnPropertyChanged(nameof(FilesUploadedText));
+    }
+
+    partial void OnTotalBytesUploadedChanged(long value)
+    {
+        OnPropertyChanged(nameof(TotalBytesUploadedText));
+    }
+
+    partial void OnFilesFailedChanged(int value)
+    {
+        OnPropertyChanged(nameof(HasSessionStats));
+        OnPropertyChanged(nameof(HasFailedJobs));
+        OnPropertyChanged(nameof(FilesFailedText));
+    }
+
+    private static string FormatSize(long bytes) => bytes switch
+    {
+        >= 1_073_741_824 => $"{bytes / 1_073_741_824.0:F1} GB",
+        >= 1_048_576     => $"{bytes / 1_048_576.0:F1} MB",
+        >= 1_024         => $"{bytes / 1_024.0:F0} KB",
+        _                => $"{bytes} B",
+    };
 
     private static string FormatSpeed(double bps) => bps switch
     {

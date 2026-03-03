@@ -51,6 +51,7 @@ public sealed class MinervaWorkerService
         {
             UseShellExecute = false,
             CreateNoWindow = true,
+            RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
         psi.ArgumentList.Add("--enable-rpc=true");
@@ -84,21 +85,25 @@ public sealed class MinervaWorkerService
     {
         var client = _aria2c;
         _aria2c = null;
+        // Fire-and-forget the RPC shutdown; then give the process a moment to exit on its own.
         try { client?.ShutdownAsync().GetAwaiter().GetResult(); } catch { }
         if (_aria2cProc is { HasExited: false })
         {
-            try { if (!_aria2cProc.WaitForExit(3000)) _aria2cProc.Kill(); }
+            try { if (!_aria2cProc.WaitForExit(2000)) _aria2cProc.Kill(); }
             catch { }
         }
         _aria2cProc = null;
     }
 
-    /// <summary>Cancels any running work and synchronously kills the aria2c daemon.  
+    /// <summary>Cancels any running work and asynchronously kills the aria2c daemon.
     /// Safe to call more than once and from any thread.</summary>
-    public void Stop()
+    public Task StopAsync()
     {
-        StopAria2cDaemon();
+        _aria2c = null;  // prevent new submissions
+        return Task.Run(StopAria2cDaemon);
     }
+
+    public void Stop() => StopAria2cDaemon();
 
     private static void AddWorkerHeaders(HttpClient client, string token)
     {
@@ -459,7 +464,8 @@ public sealed class MinervaWorkerService
     }
 
     private async Task ProcessJobAsync(WorkerSettings settings, string token,
-        JobProgressViewModel vm, JsonElement job, Action<string> log, CancellationToken ct)
+        JobProgressViewModel vm, JsonElement job, Action<string> log, CancellationToken ct,
+        Action<long>? onSuccess = null, Action? onFail = null)
     {
         var fileId = job.GetProperty("file_id").GetInt32();
         var url = job.GetProperty("url").GetString()!;
@@ -527,20 +533,16 @@ public sealed class MinervaWorkerService
                     vm.ResetSpeed();
                 });
 
-                long ulPrevSent = 0;
-                var ulSw = Stopwatch.StartNew();
+                var ulThrottle = Stopwatch.StartNew();
                 Action<long, long> ulProgressTracked = (s, t) =>
                 {
-                    var elapsed = ulSw.Elapsed.TotalSeconds;
-                    ulSw.Restart();
-                    var delta = s - ulPrevSent;
-                    ulPrevSent = s;
+                    if (ulThrottle.Elapsed.TotalMilliseconds < 200) return;
+                    ulThrottle.Restart();
                     UI(() =>
                     {
                         vm.BytesTransferred = s;
                         vm.TotalBytes = t;
-                        if (elapsed > 0 && delta > 0)
-                            vm.ForceSetSpeed(delta / elapsed);
+                        vm.UpdateSpeed(s);
                     });
                 };
 
@@ -582,18 +584,21 @@ public sealed class MinervaWorkerService
             log($"FAIL [{vm.Label}] {errMsg}");
             UI(() => { vm.Status = JobStatus.Failed; vm.SpeedText = ""; vm.ErrorMessage = errMsg; });
             try { await ReportJobAsync(settings.ServerUrl, token, fileId, "failed", error: errMsg, ct: ct); } catch { }
+            onFail?.Invoke();
             return;
         }
 
         UI(() => { vm.Status = JobStatus.Done; vm.BytesTransferred = fileSize; vm.SpeedText = ""; });
         if (inMemData is null && !settings.KeepFiles && File.Exists(localPath)) File.Delete(localPath);
+        onSuccess?.Invoke(fileSize);
 
         try { await ReportJobAsync(settings.ServerUrl, token, fileId, "completed", bytesDownloaded: fileSize, ct: ct); }
         catch { /* best-effort */ }
     }
 
     public async Task RunAsync(WorkerSettings settings, string token,
-        Action<string> log, CancellationToken ct)
+        Action<string> log, CancellationToken ct,
+        Action<long>? onSuccess = null, Action? onFail = null)
     {
         Directory.CreateDirectory(settings.TempDir);
         var seen = new ConcurrentDictionary<int, byte>();
@@ -659,7 +664,7 @@ public sealed class MinervaWorkerService
             {
                 try
                 {
-                    await ProcessJobAsync(settings, token, vm, captured, log, ct);
+                    await ProcessJobAsync(settings, token, vm, captured, log, ct, onSuccess, onFail);
                     log($"{(vm.Status == JobStatus.Done ? "OK" : "FAIL")} {vm.Label}");
                 }
                 finally

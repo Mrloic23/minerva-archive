@@ -128,6 +128,21 @@
                     </StackPanel>
                 </StackPanel>
 
+                <!-- Session counters (visible once at least one job completes or fails) -->
+                <StackPanel DockPanel.Dock="Top" Margin="0 12 0 0" Spacing="3"
+                            IsVisible="{Binding HasSessionStats}"
+                            HorizontalAlignment="Center">
+                    <TextBlock Classes="SectionHeader" Text="SESSION" HorizontalAlignment="Center" Margin="0 0 0 0"/>
+                    <TextBlock Text="{Binding FilesUploadedText}"
+                               FontSize="12" HorizontalAlignment="Center" Foreground="#4CAF50"/>
+                    <TextBlock Text="{Binding TotalBytesUploadedText}"
+                               FontSize="12" HorizontalAlignment="Center"
+                               Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
+                    <TextBlock Text="{Binding FilesFailedText}"
+                               FontSize="12" HorizontalAlignment="Center" Foreground="#EF5350"
+                               IsVisible="{Binding HasFailedJobs}"/>
+                </StackPanel>
+
             </DockPanel>
         </Border>
 
