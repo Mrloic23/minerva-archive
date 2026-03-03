@@ -577,6 +577,7 @@ public sealed class MinervaWorkerService
 
         if (!uploaded)
         {
+            if (inMemData is null && File.Exists(localPath)) try { File.Delete(localPath); } catch { }
             var errMsg = BuildErrorMessage(lastErr, MaxRetries);
             log($"FAIL [{vm.Label}] {errMsg}");
             UI(() => { vm.Status = JobStatus.Failed; vm.SpeedText = ""; vm.ErrorMessage = errMsg; });
