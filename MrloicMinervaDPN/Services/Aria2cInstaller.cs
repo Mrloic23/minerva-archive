@@ -38,16 +38,31 @@ static class Aria2cInstaller
 
         if (!autoInstall)
         {
-            log("aria2c not found and auto-install is disabled. " +
-                "Install aria2 manually for parallel/multi-connection downloads.");
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                log("aria2c not found. Install manually: 'sudo apt install aria2' (Ubuntu/Debian) or 'sudo yum install aria2' (CentOS/RHEL) or 'sudo pacman -S aria2' (Arch).");
+            }
+            else
+            {
+                log("aria2c not found and auto-install is disabled. " +
+                    "Install aria2 manually for parallel/multi-connection downloads.");
+            }
             return null;
         }
 
         // 3. Determine platform download.
         if (!TryGetDownload(out var url, out var isTarBz2, out var entryInZip))
         {
-            log("aria2c: auto-install not supported on this platform. " +
-                "Install aria2 manually for parallel/multi-connection downloads.");
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                log("aria2c: auto-install not available for Linux. " +
+                    "Install manually: 'sudo apt install aria2' (Ubuntu/Debian) or 'sudo yum install aria2' (CentOS/RHEL) or 'sudo pacman -S aria2' (Arch).");
+            }
+            else
+            {
+                log("aria2c: auto-install not supported on this platform. " +
+                    "Install aria2 manually for parallel/multi-connection downloads.");
+            }
             return null;
         }
 
@@ -131,12 +146,12 @@ static class Aria2cInstaller
             return true;
         }
 
-        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) && arch == Architecture.X64)
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
-            var stem = $"aria2-{Aria2Version}-linux-gnu-64bit-build1";
-            url = $"https://github.com/aria2/aria2/releases/download/release-{Aria2Version}/{stem}.tar.bz2";
-            isTarBz2 = true;
-            return true;
+            // aria2 does not provide pre-compiled Linux binaries
+            // Users should install via package manager: apt install aria2, yum install aria2, etc.
+            url = "";
+            return false;
         }
 
         url = "";
