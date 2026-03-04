@@ -222,6 +222,12 @@
                         <NumericUpDown Classes="Setting" Value="{Binding InMemoryThresholdMb}"
                                        Minimum="0" Maximum="1048576" Increment="1"
                                        FormatString="0"/>
+                        <TextBlock Text="Deferred upload cache (MB, 0=unlimited)" FontSize="11" Margin="0 8 0 2"
+                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                   ToolTip.Tip="Max disk space used by files that have been downloaded but are waiting for the upload server to recover. When the limit is reached, new files are dropped instead of cached."/>
+                        <NumericUpDown Classes="Setting" Value="{Binding MaxCacheSizeMb}"
+                                       Minimum="0" Maximum="1048576" Increment="256"
+                                       FormatString="0"/>
                     </StackPanel>
                 </Grid>
             </Border>

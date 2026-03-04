@@ -34,6 +34,8 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private bool _keepFiles;
     /// <summary>Files at or below this size (in MB) are kept only in RAM. 0 = always use disk.</summary>
     [ObservableProperty] private decimal _inMemoryThresholdMb = 0;
+    /// <summary>Max disk space (MB) used by files cached while the upload server is down. 0 = unlimited.</summary>
+    [ObservableProperty] private decimal _maxCacheSizeMb = 10240;
 
     // ── Worker state ───────────────────────────────────────────────────────
     [ObservableProperty] private bool _isRunning;
@@ -61,6 +63,19 @@ public partial class MainWindowViewModel : ViewModelBase
 
     public MainWindowViewModel()
     {
+        var s = SettingsStore.Load();
+        ServerUrl           = s.ServerUrl;
+        UploadServerUrl     = s.UploadServerUrl;
+        Concurrency         = s.Concurrency;
+        UploadConcurrency   = s.UploadConcurrency;
+        BatchSize           = s.BatchSize;
+        Aria2cConnections   = s.Aria2cConnections;
+        AutoInstallAria2c   = s.AutoInstallAria2c;
+        TempDir             = s.TempDir;
+        KeepFiles           = s.KeepFiles;
+        InMemoryThresholdMb = s.InMemoryThresholdMb;
+        MaxCacheSizeMb      = s.MaxCacheSizeMb;
+
         IsLoggedIn = TokenStore.Load() != null;
         _ = StartUpdateCheckLoopAsync();
     }
@@ -160,6 +175,7 @@ public partial class MainWindowViewModel : ViewModelBase
             TempDir = TempDir,
             KeepFiles = KeepFiles,
             InMemoryThresholdBytes = (long)(InMemoryThresholdMb * 1024 * 1024),
+            MaxCacheSizeBytes = (long)(MaxCacheSizeMb * 1024 * 1024),
         };
 
         _speedTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
@@ -214,6 +230,20 @@ public partial class MainWindowViewModel : ViewModelBase
     }
     public Task ShutdownAsync()
     {
+        SettingsStore.Save(new PersistedSettings
+        {
+            ServerUrl           = ServerUrl,
+            UploadServerUrl     = UploadServerUrl,
+            Concurrency         = Concurrency,
+            UploadConcurrency   = UploadConcurrency,
+            BatchSize           = BatchSize,
+            Aria2cConnections   = Aria2cConnections,
+            AutoInstallAria2c   = AutoInstallAria2c,
+            TempDir             = TempDir,
+            KeepFiles           = KeepFiles,
+            InMemoryThresholdMb = InMemoryThresholdMb,
+            MaxCacheSizeMb      = MaxCacheSizeMb,
+        });
         _loginCts?.Cancel();
         _workerCts?.Cancel();
         return _workerService.StopAsync();

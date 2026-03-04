@@ -24,6 +24,35 @@ public sealed class MinervaWorkerService
     private const long UploadChunkSize = 8 * 1024 * 1024;
 
     private static readonly int[] RetriableStatusCodes = [408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524];
+    /// <summary>Retry delays for deferred jobs. Once the last value is reached it repeats indefinitely.</summary>
+    private static readonly TimeSpan[] DeferSchedule =
+    [
+        TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(10),
+        TimeSpan.FromMinutes(20), TimeSpan.FromMinutes(30)
+    ];
+
+    /// <summary>Tracks total bytes of downloaded-but-not-yet-uploaded files that are cached
+    /// while the upload server is unavailable, preventing unbounded disk usage.</summary>
+    private sealed class CacheTracker(long maxBytes)
+    {
+        private long _used;
+        public long MaxBytes => maxBytes;
+        public long Used => Volatile.Read(ref _used);
+
+        /// <summary>Atomically reserves <paramref name="bytes"/>.
+        /// Returns false (without reserving) when maxBytes is set and the limit would be exceeded.</summary>
+        public bool TryReserve(long bytes)
+        {
+            if (maxBytes <= 0) { Interlocked.Add(ref _used, bytes); return true; }
+            while (true)
+            {
+                var cur = Volatile.Read(ref _used);
+                if (cur + bytes > maxBytes) return false;
+                if (Interlocked.CompareExchange(ref _used, cur + bytes, cur) == cur) return true;
+            }
+        }
+        public void Release(long bytes) => Interlocked.Add(ref _used, -bytes);
+    }
 
     private Process? _aria2cProc;
     private Aria2NetClient? _aria2c;
@@ -451,22 +480,29 @@ public sealed class MinervaWorkerService
         return $"Failed after {totalAttempts} attempt{(totalAttempts != 1 ? "s" : "")}: {ExceptionSummary(ex)}";
     }
 
+    /// <summary>Returns true when <paramref name="ex"/> was caused by a retriable server-side HTTP error.</summary>
+    private static bool IsServerError(Exception? ex) =>
+        ex is HttpRequestException { StatusCode: { } sc } && IsRetriable((int)sc);
+
+    private enum DownloadOutcome { Sent, Deferred, Failed }
+
     /// <summary>Payload passed from a download worker to an upload worker.</summary>
     private sealed record DownloadedJob(
         WorkerSettings Settings, string Token, JobProgressViewModel Vm, JsonElement Job,
         byte[]? InMemData, string? LocalPath, long FileSize,
-        Action<string> Log, Action<long>? OnSuccess, Action? OnFail);
+        Action<string> Log, Action<long>? OnSuccess, Action? OnFail,
+        CacheTracker Cache);
 
     /// <summary>
     /// Download phase: retries up to MaxRetries times.
     /// On success writes to <paramref name="uploadWriter"/> and returns true.
     /// On total failure reports to the server and returns false.
     /// </summary>
-    private async Task<bool> DownloadPhaseAsync(
+    private async Task<DownloadOutcome> DownloadPhaseAsync(
         WorkerSettings settings, string token, JobProgressViewModel vm, JsonElement job,
         Action<string> log, CancellationToken ct,
         ChannelWriter<DownloadedJob> uploadWriter,
-        Action<long>? onSuccess, Action? onFail)
+        Action<long>? onSuccess, Action? onFail, CacheTracker cache)
     {
         var fileId   = job.GetProperty("file_id").GetInt32();
         var url      = job.GetProperty("url").GetString()!;
@@ -515,8 +551,8 @@ public sealed class MinervaWorkerService
                 await uploadWriter.WriteAsync(
                     new DownloadedJob(settings, token, vm, job,
                         inMemData, inMemData is null ? localPath : null,
-                        fileSize, log, onSuccess, onFail), CancellationToken.None);
-                return true;
+                        fileSize, log, onSuccess, onFail, cache), CancellationToken.None);
+                return DownloadOutcome.Sent;
             }
             catch (OperationCanceledException) { throw; }
             catch (Exception ex)
@@ -534,12 +570,16 @@ public sealed class MinervaWorkerService
             }
         }
 
+        // Server-side errors are deferred for retry by the caller; other errors are permanent.
+        if (IsServerError(lastErr))
+            return DownloadOutcome.Deferred;
+
         var errMsg = BuildErrorMessage(lastErr, MaxRetries);
         log($"DL-FAIL [{vm.Label}] {errMsg}");
         UI(() => { vm.Status = JobStatus.Failed; vm.SpeedText = ""; vm.ErrorMessage = errMsg; });
         try { await ReportJobAsync(settings.ServerUrl, token, fileId, "failed", error: errMsg, ct: ct); } catch { }
         onFail?.Invoke();
-        return false;
+        return DownloadOutcome.Failed;
     }
 
     /// <summary>
@@ -547,7 +587,7 @@ public sealed class MinervaWorkerService
     /// </summary>
     private async Task UploadPhaseAsync(DownloadedJob dl, CancellationToken ct)
     {
-        var (settings, token, vm, job, inMemData, localPath, fileSize, log, onSuccess, onFail) = dl;
+        var (settings, token, vm, job, inMemData, localPath, fileSize, log, onSuccess, onFail, cache) = dl;
         var fileId = job.GetProperty("file_id").GetInt32();
         void UI(Action a) => Avalonia.Threading.Dispatcher.UIThread.Post(a);
         Exception? lastErr = null;
@@ -615,6 +655,65 @@ public sealed class MinervaWorkerService
             }
         }
 
+        // If all fast retries failed with a server error, hold the downloaded file and
+        // keep retrying with increasing delays until the server recovers, the worker is
+        // stopped, or adding this file to the cache would exceed the configured limit.
+        if (IsServerError(lastErr))
+        {
+            if (!cache.TryReserve(fileSize))
+            {
+                var limitMb = cache.MaxBytes / (1024 * 1024);
+                log($"UL-FAIL [{vm.Label}] Cache full ({limitMb} MB limit) — dropping file");
+            }
+            else
+            {
+                try
+                {
+                    int d = 0;
+                    while (!ct.IsCancellationRequested)
+                    {
+                        var delay = DeferSchedule[Math.Min(d, DeferSchedule.Length - 1)];
+                        var waitMsg = $"Server error — retrying in {delay.TotalMinutes:0}m";
+                        log($"UL-DEFER [{vm.Label}] {waitMsg}");
+                        UI(() => { vm.Status = JobStatus.Retrying; vm.SpeedText = ""; vm.ErrorMessage = waitMsg; });
+                        try { await Task.Delay(delay, ct); } catch (OperationCanceledException) { break; }
+                        if (ct.IsCancellationRequested) break;
+                        try
+                        {
+                            UI(() => { vm.Status = JobStatus.Uploading; vm.BytesTransferred = 0; vm.TotalBytes = fileSize; vm.ResetSpeed(); });
+                            Action<long, long> ulProgress = (s, t) => UI(() => { vm.BytesTransferred = s; vm.TotalBytes = t; vm.UpdateSpeed(s); });
+                            if (inMemData is not null)
+                            {
+                                using var ms = new MemoryStream(inMemData);
+                                await UploadStreamAsync(settings.UploadServerUrl, token, fileId, ms, fileSize, ulProgress, ct);
+                            }
+                            else
+                            {
+                                await using var fs = new FileStream(localPath!, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, true);
+                                await UploadStreamAsync(settings.UploadServerUrl, token, fileId, fs, fileSize, ulProgress, ct);
+                            }
+                            UI(() => { vm.Status = JobStatus.Done; vm.BytesTransferred = fileSize; vm.SpeedText = ""; });
+                            if (inMemData is null && !settings.KeepFiles && localPath != null && File.Exists(localPath))
+                                File.Delete(localPath);
+                            onSuccess?.Invoke(fileSize);
+                            log($"OK (deferred upload) [{vm.Label}]");
+                            try { await ReportJobAsync(settings.ServerUrl, token, fileId, "completed", bytesDownloaded: fileSize, ct: CancellationToken.None); } catch { }
+                            return;
+                        }
+                        catch (OperationCanceledException) { break; }
+                        catch (Exception ex)
+                        {
+                            lastErr = ex;
+                            log($"UL-DEFER-FAIL [{vm.Label}] retry {d + 1}: {ExceptionSummary(ex)}");
+                            if (!IsServerError(ex)) break; // Non-server error — stop deferring
+                            d++;
+                        }
+                    }
+                }
+                finally { cache.Release(fileSize); }
+            }
+        }
+
         if (inMemData is null && localPath != null && File.Exists(localPath))
             try { File.Delete(localPath); } catch { }
         var errMsg = BuildErrorMessage(lastErr, MaxRetries);
@@ -630,6 +729,11 @@ public sealed class MinervaWorkerService
     {
         Directory.CreateDirectory(settings.TempDir);
         var seen = new ConcurrentDictionary<int, byte>();
+        // Tracks bytes currently reserved by deferred upload jobs.
+        var cache = new CacheTracker(settings.MaxCacheSizeBytes);
+        // Jobs that failed to download due to server errors are re-queued here with a notBefore timestamp.
+        var deferredQueue = new ConcurrentQueue<(JsonElement Job, DateTimeOffset NotBefore, int DeferCount)>();
+        var deferralCounts = new ConcurrentDictionary<int, int>();
 
         // Channel 1: raw jobs from the API → download workers
         var jobChannel = Channel.CreateBounded<JsonElement>(
@@ -654,6 +758,17 @@ public sealed class MinervaWorkerService
 
             while (!ct.IsCancellationRequested)
             {
+                // Re-inject any deferred download jobs whose wait period has elapsed.
+                while (deferredQueue.TryPeek(out var pending) && pending.NotBefore <= DateTimeOffset.UtcNow)
+                {
+                    if (deferredQueue.TryDequeue(out var deferred))
+                    {
+                        var fid = deferred.Job.GetProperty("file_id").GetInt32();
+                        if (seen.TryAdd(fid, 0))
+                            await jobChannel.Writer.WriteAsync(deferred.Job, ct);
+                    }
+                }
+
                 try
                 {
                     var resp = await client.GetAsync(
@@ -697,19 +812,33 @@ public sealed class MinervaWorkerService
                 {
                     var vm = new JobProgressViewModel();
                     Avalonia.Threading.Dispatcher.UIThread.Post(() => ActiveJobs.Add(vm));
-                    bool ok = false;
+                    var outcome = DownloadOutcome.Failed;
                     try
                     {
-                        ok = await DownloadPhaseAsync(settings, token, vm, job, log, ct,
-                            uploadChannel.Writer, onSuccess, onFail);
+                        outcome = await DownloadPhaseAsync(settings, token, vm, job, log, ct,
+                            uploadChannel.Writer, onSuccess, onFail, cache);
                     }
                     catch (OperationCanceledException) { }
                     finally
                     {
-                        if (!ok)
+                        if (outcome != DownloadOutcome.Sent)
                         {
-                            // Download failed entirely — clean up now; upload worker won't see this job.
-                            seen.TryRemove(job.GetProperty("file_id").GetInt32(), out _);
+                            var fid = job.GetProperty("file_id").GetInt32();
+                            if (outcome == DownloadOutcome.Deferred && !ct.IsCancellationRequested)
+                            {
+                                // Retry indefinitely: advance through DeferSchedule then hold at the last delay.
+                                var dCount = deferralCounts.AddOrUpdate(fid, 1, (_, v) => v + 1);
+                                var delay = DeferSchedule[Math.Min(dCount - 1, DeferSchedule.Length - 1)];
+                                deferredQueue.Enqueue((job, DateTimeOffset.UtcNow + delay, dCount));
+                                log($"DL-DEFER [{vm.Label}] Server error — retrying in {delay.TotalMinutes:0}m");
+                                seen.TryRemove(fid, out _); // allow producer to re-inject when ready
+                                Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+                                    vm.ErrorMessage = $"Server error — retrying in {delay.TotalMinutes:0}m");
+                            }
+                            else
+                            {
+                                seen.TryRemove(fid, out _);
+                            }
                             if (!ct.IsCancellationRequested)
                                 await Task.Delay(TimeSpan.FromSeconds(3), CancellationToken.None);
                             Avalonia.Threading.Dispatcher.UIThread.Post(() => ActiveJobs.Remove(vm));

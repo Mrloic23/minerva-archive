@@ -19,4 +19,7 @@ public sealed class WorkerSettings
     /// <summary>Files whose known size is at or below this threshold are kept entirely in
     /// RAM — never written to <see cref="TempDir"/>. 0 = always write to disk.</summary>
     public long InMemoryThresholdBytes { get; set; } = 0;
+    /// <summary>Maximum total bytes that may be held on disk as deferred upload cache
+    /// (files downloaded but waiting for the upload server to recover). 0 = unlimited.</summary>
+    public long MaxCacheSizeBytes { get; set; } = 10L * 1024 * 1024 * 1024;
 }
