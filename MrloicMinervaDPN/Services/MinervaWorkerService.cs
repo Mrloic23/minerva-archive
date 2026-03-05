@@ -16,6 +16,10 @@ using Aria2NET;
 using MrloicMinervaDPN.Models;
 
 namespace MrloicMinervaDPN.Services;
+/// <summary>Thrown when the upload server permanently rejects a file (e.g. HTTP 422).
+/// Retrying will not help — the job should be marked failed immediately.</summary>
+public sealed class PermanentUploadException(string message) : Exception(message);
+
 public sealed class MinervaWorkerService
 {
     private const string Version = "1.2.4";
@@ -23,7 +27,7 @@ public sealed class MinervaWorkerService
     private const int RetryDelaySeconds = 5;
     private const long UploadChunkSize = 8 * 1024 * 1024;
 
-    private static readonly int[] RetriableStatusCodes = [408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524];
+    private static readonly HashSet<int> RetriableStatusCodes = [408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524];
     /// <summary>Retry delays for deferred jobs. Once the last value is reached it repeats indefinitely.</summary>
     private static readonly TimeSpan[] DeferSchedule =
     [
@@ -56,6 +60,7 @@ public sealed class MinervaWorkerService
     private Process? _aria2cProc;
     private Aria2NetClient? _aria2c;
     private string _aria2cSecret = "";
+    private readonly SessionStore _sessions = new();
 
     public ObservableCollection<JobProgressViewModel> ActiveJobs { get; } = [];
 
@@ -128,8 +133,39 @@ public sealed class MinervaWorkerService
         client.DefaultRequestHeaders.Add("X-Minerva-Worker-Version", Version);
     }
 
-    private static bool IsRetriable(int code) =>
-        Array.IndexOf(RetriableStatusCodes, code) >= 0;
+    private static bool IsRetriable(int code) => RetriableStatusCodes.Contains(code);
+
+    /// <summary>Codes that mean the upload session no longer exists server-side and we should
+    /// open a fresh one. 422 is intentionally excluded — it means the content itself was
+    /// rejected (e.g. SHA mismatch, illegal file), not that the session is missing.</summary>
+    private static bool IsSessionGone(int code) => code is 404 or 410 or 412;
+
+    /// <summary>Reads the response body and throws an <see cref="InvalidOperationException"/>
+    /// whose message includes the HTTP status and any "detail" field from the JSON body.
+    /// Always throws; return type is Task only so callers can write <c>await ThrowHttpErrorAsync(…)</c>.</summary>
+    private static async Task ThrowHttpErrorAsync(HttpResponseMessage resp, CancellationToken ct)
+    {
+        string body = "";
+        try { body = (await resp.Content.ReadAsStringAsync(ct)).Trim(); } catch { }
+        if (!string.IsNullOrEmpty(body))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                if (doc.RootElement.TryGetProperty("detail", out var d))
+                    body = d.ValueKind == JsonValueKind.String ? d.GetString()! : d.GetRawText();
+            }
+            catch { }
+        }
+        var msg = $"HTTP {(int)resp.StatusCode} {resp.StatusCode}";
+        if (!string.IsNullOrEmpty(body)) msg += $": {body}";
+        // 4xx that are not session-related are permanent — the server will not accept this
+        // file regardless of how many times we retry. Signal this to callers.
+        var sc = (int)resp.StatusCode;
+        if (sc >= 400 && sc < 500 && !IsSessionGone(sc) && !IsRetriable(sc))
+            throw new PermanentUploadException(msg);
+        throw new InvalidOperationException(msg);
+    }
 
     private static double RetrySleep(int attempt, double cap = 25.0) =>
         Math.Min(cap, 0.85 * attempt + Random.Shared.NextDouble() * 1.25);
@@ -316,110 +352,173 @@ public sealed class MinervaWorkerService
 
     private async Task UploadStreamAsync(
         string uploadServerUrl, string token, int fileId, Stream src, long fileSize,
-        Action<long, long> onProgress, CancellationToken ct)
+        Action<long, long> onProgress, SessionStore sessions, CancellationToken ct)
     {
         using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(300) };
         AddWorkerHeaders(client, token);
 
-        // 1. Start session
-        string? sessionId = null;
-        for (int attempt = 1; attempt <= 12; attempt++)
+        const int maxSessionRestarts = 5;
+        for (int sessionAttempt = 1; sessionAttempt <= maxSessionRestarts; sessionAttempt++)
         {
-            try
+            // Rewind so a session restart always uploads from the beginning.
+            src.Seek(0, SeekOrigin.Begin);
+            bool sessionExpired = false;
+
+            // 1. Start session — reuse a persisted session ID if one exists for this file,
+            // so repeated attempts never open a duplicate session (which causes HTTP 412).
+            string? sessionId = sessions.Get(fileId);
+            if (sessionId is null)
             {
-                var resp = await client.PostAsync($"{uploadServerUrl}/api/upload/{fileId}/start",
-                    new ByteArrayContent([]), ct);
-                if ((int)resp.StatusCode == 426)
-                    throw new InvalidOperationException("Worker update required");
-                if (IsRetriable((int)resp.StatusCode))
+                for (int attempt = 1; attempt <= 12; attempt++)
                 {
-                    if (attempt == 12) resp.EnsureSuccessStatusCode();
-                    await Task.Delay(TimeSpan.FromSeconds(RetrySleep(attempt)), ct);
-                    continue;
+                    try
+                    {
+                        var resp = await client.PostAsync($"{uploadServerUrl}/api/upload/{fileId}/start",
+                            new ByteArrayContent([]), ct);
+                        if ((int)resp.StatusCode == 426)
+                            throw new InvalidOperationException("Worker update required");
+                        if ((int)resp.StatusCode == 412)
+                        {
+                            try
+                            {
+                                var body = await resp.Content.ReadAsStringAsync(ct);
+                                using var doc = JsonDocument.Parse(body);
+                                var root = doc.RootElement;
+                                // Accept either {"session_id": "..."} or {"detail": {"session_id": "..."}}
+                                if (root.TryGetProperty("session_id", out var sidEl) && sidEl.GetString() is { } sid && sid.Length > 0)
+                                { sessionId = sid; sessions.Set(fileId, sessionId); break; }
+                                if (root.TryGetProperty("detail", out var detailEl) && detailEl.ValueKind == JsonValueKind.Object &&
+                                    detailEl.TryGetProperty("session_id", out var sid2El) && sid2El.GetString() is { } sid2 && sid2.Length > 0)
+                                { sessionId = sid2; sessions.Set(fileId, sessionId); break; }
+                            }
+                            catch { }
+                            // No session_id in response — wait for the server-side session to expire.
+                            if (attempt == 12) throw new InvalidOperationException($"HTTP 412: server has an active session for file {fileId} and did not return its ID");
+                            await Task.Delay(TimeSpan.FromSeconds(RetrySleep(attempt, 30)), ct);
+                            continue;
+                        }
+                        if (IsRetriable((int)resp.StatusCode))
+                        {
+                            if (attempt == 12) await ThrowHttpErrorAsync(resp, ct);
+                            await Task.Delay(TimeSpan.FromSeconds(RetrySleep(attempt)), ct);
+                            continue;
+                        }
+                        if (!resp.IsSuccessStatusCode) await ThrowHttpErrorAsync(resp, ct);
+                        using var sdoc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
+                        sessionId = sdoc.RootElement.GetProperty("session_id").GetString();
+                        if (sessionId is not null) sessions.Set(fileId, sessionId);
+                        break;
+                    }
+                    catch (HttpRequestException ex) when (attempt < 12 && (ex.StatusCode is null || IsRetriable((int)ex.StatusCode.Value)))
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(RetrySleep(attempt)), ct);
+                    }
                 }
-                resp.EnsureSuccessStatusCode();
-                using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
-                sessionId = doc.RootElement.GetProperty("session_id").GetString();
-                break;
             }
-            catch (HttpRequestException ex) when (attempt < 12 && (ex.StatusCode is null || IsRetriable((int)ex.StatusCode.Value)))
+            if (sessionId is null) throw new InvalidOperationException("Failed to create upload session");
+
+            // 2. Send chunks
+            long sent = 0;
+            using var sha = SHA256.Create();
+            var buf = new byte[UploadChunkSize];
+            int read;
+            while (!sessionExpired && (read = await src.ReadAsync(buf, ct)) > 0)
             {
-                await Task.Delay(TimeSpan.FromSeconds(RetrySleep(attempt)), ct);
+                sha.TransformBlock(buf, 0, read, null, 0);
+
+                for (int attempt = 1; attempt <= 30; attempt++)
+                {
+                    try
+                    {
+                        long chunkSent = 0;
+                        using var ms = new MemoryStream(buf, 0, read, writable: false);
+                        var progressStream = new ProgressStream(ms, written =>
+                        {
+                            chunkSent += written;
+                            onProgress(sent + chunkSent, fileSize);
+                        });
+                        var content = new StreamContent(progressStream);
+                        content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                        var resp = await client.PostAsync(
+                            $"{uploadServerUrl}/api/upload/{fileId}/chunk?session_id={sessionId}",
+                            content, ct);
+                        if ((int)resp.StatusCode == 426)
+                            throw new InvalidOperationException("Worker update required");
+                        var sc = (int)resp.StatusCode;
+                        // Session is gone server-side — discard it and restart from /start.
+                        if (IsSessionGone(sc)) { sessions.Remove(fileId); sessionExpired = true; break; }
+                        if (IsRetriable(sc))
+                        {
+                            if (attempt == 30) await ThrowHttpErrorAsync(resp, ct);
+                            await Task.Delay(TimeSpan.FromSeconds(RetrySleep(attempt, 20)), ct);
+                            continue;
+                        }
+                        // Any other 4xx/5xx (e.g. 422 UnprocessableEntity) is a permanent
+                        // rejection — throw immediately with the server's error body.
+                        if (!resp.IsSuccessStatusCode) await ThrowHttpErrorAsync(resp, ct);
+                        break;
+                    }
+                    catch (HttpRequestException ex) when (attempt < 30 && (ex.StatusCode is null || IsRetriable((int)ex.StatusCode.Value)))
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(RetrySleep(attempt, 20)), ct);
+                    }
+                }
+
+                if (!sessionExpired)
+                    sent += read;
             }
-        }
-        if (sessionId is null) throw new InvalidOperationException("Failed to create upload session");
 
-        // 2. Send chunks
-        long sent = 0;
-        using var sha = SHA256.Create();
-        var buf = new byte[UploadChunkSize];
-        int read;
-        while ((read = await src.ReadAsync(buf, ct)) > 0)
-        {
-            var chunk = buf[..read];
-            sha.TransformBlock(chunk, 0, chunk.Length, null, 0);
+            if (sessionExpired)
+            {
+                if (sessionAttempt == maxSessionRestarts)
+                    throw new InvalidOperationException("Upload session expired repeatedly; giving up.");
+                await Task.Delay(TimeSpan.FromSeconds(RetrySleep(sessionAttempt)), ct);
+                continue;
+            }
 
-            for (int attempt = 1; attempt <= 30; attempt++)
+            // 3. Finish
+            sha.TransformFinalBlock([], 0, 0);
+            var hash = Convert.ToHexStringLower(sha.Hash!);
+            bool finishExpired = false;
+            for (int attempt = 1; attempt <= 12; attempt++)
             {
                 try
                 {
-                    long chunkSent = 0;
-                    using var ms = new MemoryStream(chunk, 0, chunk.Length, writable: false);
-                    var progressStream = new ProgressStream(ms, written =>
-                    {
-                        chunkSent += written;
-                        onProgress(sent + chunkSent, fileSize);
-                    });
-                    var content = new StreamContent(progressStream);
-                    content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
                     var resp = await client.PostAsync(
-                        $"{uploadServerUrl}/api/upload/{fileId}/chunk?session_id={sessionId}",
-                        content, ct);
+                        $"{uploadServerUrl}/api/upload/{fileId}/finish?session_id={sessionId}&expected_sha256={hash}",
+                        new ByteArrayContent([]), ct);
                     if ((int)resp.StatusCode == 426)
                         throw new InvalidOperationException("Worker update required");
-                    if (IsRetriable((int)resp.StatusCode))
+                    var fsc = (int)resp.StatusCode;
+                    // Session gone — restart from /start.
+                    if (IsSessionGone(fsc)) { sessions.Remove(fileId); finishExpired = true; break; }
+                    if (IsRetriable(fsc))
                     {
-                        if (attempt == 30) resp.EnsureSuccessStatusCode();
+                        if (attempt == 12) await ThrowHttpErrorAsync(resp, ct);
                         await Task.Delay(TimeSpan.FromSeconds(RetrySleep(attempt, 20)), ct);
                         continue;
                     }
-                    resp.EnsureSuccessStatusCode();
+                    // Permanent rejection (e.g. 422 = SHA mismatch or invalid content).
+                    // Do NOT restart the session — throw with full server detail for logging.
+                    if (!resp.IsSuccessStatusCode) await ThrowHttpErrorAsync(resp, ct);
                     break;
                 }
-                catch (HttpRequestException ex) when (attempt < 30 && (ex.StatusCode is null || IsRetriable((int)ex.StatusCode.Value)))
+                catch (HttpRequestException ex) when (attempt < 12 && (ex.StatusCode is null || IsRetriable((int)ex.StatusCode.Value)))
                 {
                     await Task.Delay(TimeSpan.FromSeconds(RetrySleep(attempt, 20)), ct);
                 }
             }
 
-            sent += read;
-        }
+            if (finishExpired)
+            {
+                if (sessionAttempt == maxSessionRestarts)
+                    throw new InvalidOperationException("Upload session expired repeatedly; giving up.");
+                await Task.Delay(TimeSpan.FromSeconds(RetrySleep(sessionAttempt)), ct);
+                continue;
+            }
 
-        // 3. Finish
-        sha.TransformFinalBlock([], 0, 0);
-        var hash = Convert.ToHexStringLower(sha.Hash!);
-        for (int attempt = 1; attempt <= 12; attempt++)
-        {
-            try
-            {
-                var resp = await client.PostAsync(
-                    $"{uploadServerUrl}/api/upload/{fileId}/finish?session_id={sessionId}&expected_sha256={hash}",
-                    new ByteArrayContent([]), ct);
-                if ((int)resp.StatusCode == 426)
-                    throw new InvalidOperationException("Worker update required");
-                if (IsRetriable((int)resp.StatusCode))
-                {
-                    if (attempt == 12) resp.EnsureSuccessStatusCode();
-                    await Task.Delay(TimeSpan.FromSeconds(RetrySleep(attempt, 20)), ct);
-                    continue;
-                }
-                resp.EnsureSuccessStatusCode();
-                break;
-            }
-            catch (HttpRequestException ex) when (attempt < 12 && (ex.StatusCode is null || IsRetriable((int)ex.StatusCode.Value)))
-            {
-                await Task.Delay(TimeSpan.FromSeconds(RetrySleep(attempt, 20)), ct);
-            }
+            sessions.Remove(fileId); // Clean up persisted session on success.
+            return; // Upload complete.
         }
     }
 
@@ -547,6 +646,7 @@ public sealed class MinervaWorkerService
 
                 long fileSize = inMemData is not null ? inMemData.LongLength : new FileInfo(localPath).Length;
 
+                UI(() => { vm.Status = JobStatus.Queued; vm.SpeedText = ""; });
                 await uploadWriter.WriteAsync(
                     new DownloadedJob(settings, token, vm, job,
                         inMemData, inMemData is null ? localPath : null,
@@ -590,6 +690,7 @@ public sealed class MinervaWorkerService
         var fileId = job.GetProperty("file_id").GetInt32();
         void UI(Action a) => Avalonia.Threading.Dispatcher.UIThread.Post(a);
         Exception? lastErr = null;
+        Action<long, long> ulProgress = (s, t) => UI(() => { vm.BytesTransferred = s; vm.TotalBytes = t; vm.UpdateSpeed(s); });
 
         // The loop guard intentionally omits a ct check so that already-downloaded files
         // always get an upload attempt even when the worker is stopping.
@@ -609,26 +710,15 @@ public sealed class MinervaWorkerService
 
                 log($"Uploading [{vm.Label}] attempt {attempt}/{MaxRetries}…");
 
-                Action<long, long> ulProgress = (s, t) =>
-                {
-                    // Let UpdateSpeed's internal gate rate-limit; just post every call.
-                    UI(() =>
-                    {
-                        vm.BytesTransferred = s;
-                        vm.TotalBytes = t;
-                        vm.UpdateSpeed(s);
-                    });
-                };
-
                 if (inMemData is not null)
                 {
                     using var ms = new MemoryStream(inMemData);
-                    await UploadStreamAsync(settings.UploadServerUrl, token, fileId, ms, fileSize, ulProgress, ct);
+                    await UploadStreamAsync(settings.UploadServerUrl, token, fileId, ms, fileSize, ulProgress, _sessions, ct);
                 }
                 else
                 {
                     await using var fs = new FileStream(localPath!, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, true);
-                    await UploadStreamAsync(settings.UploadServerUrl, token, fileId, fs, fileSize, ulProgress, ct);
+                    await UploadStreamAsync(settings.UploadServerUrl, token, fileId, fs, fileSize, ulProgress, _sessions, ct);
                 }
 
                 UI(() => { vm.Status = JobStatus.Done; vm.BytesTransferred = fileSize; vm.SpeedText = ""; });
@@ -640,6 +730,18 @@ public sealed class MinervaWorkerService
                 return;
             }
             catch (OperationCanceledException) { throw; }
+            catch (PermanentUploadException ex)
+            {
+                // Server permanently rejected this file — no point retrying at all.
+                var msg = ExceptionSummary(ex);
+                log($"UL-FAIL [{vm.Label}] Permanent rejection: {msg}");
+                UI(() => { vm.Status = JobStatus.Failed; vm.SpeedText = ""; vm.ErrorMessage = msg; });
+                if (inMemData is null && localPath != null && File.Exists(localPath))
+                    try { File.Delete(localPath); } catch { }
+                try { await ReportJobAsync(settings.ServerUrl, token, fileId, "failed", error: msg, ct: ct); } catch { }
+                onFail?.Invoke();
+                return;
+            }
             catch (Exception ex)
             {
                 lastErr = ex;
@@ -676,20 +778,18 @@ public sealed class MinervaWorkerService
                         log($"UL-DEFER [{vm.Label}] {waitMsg}");
                         UI(() => { vm.Status = JobStatus.Retrying; vm.SpeedText = ""; vm.ErrorMessage = waitMsg; });
                         try { await Task.Delay(delay, ct); } catch (OperationCanceledException) { break; }
-                        if (ct.IsCancellationRequested) break;
                         try
                         {
                             UI(() => { vm.Status = JobStatus.Uploading; vm.BytesTransferred = 0; vm.TotalBytes = fileSize; vm.ResetSpeed(); });
-                            Action<long, long> ulProgress = (s, t) => UI(() => { vm.BytesTransferred = s; vm.TotalBytes = t; vm.UpdateSpeed(s); });
                             if (inMemData is not null)
                             {
                                 using var ms = new MemoryStream(inMemData);
-                                await UploadStreamAsync(settings.UploadServerUrl, token, fileId, ms, fileSize, ulProgress, ct);
+                                await UploadStreamAsync(settings.UploadServerUrl, token, fileId, ms, fileSize, ulProgress, _sessions, ct);
                             }
                             else
                             {
                                 await using var fs = new FileStream(localPath!, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, true);
-                                await UploadStreamAsync(settings.UploadServerUrl, token, fileId, fs, fileSize, ulProgress, ct);
+                                await UploadStreamAsync(settings.UploadServerUrl, token, fileId, fs, fileSize, ulProgress, _sessions, ct);
                             }
                             UI(() => { vm.Status = JobStatus.Done; vm.BytesTransferred = fileSize; vm.SpeedText = ""; });
                             if (inMemData is null && !settings.KeepFiles && localPath != null && File.Exists(localPath))
@@ -700,6 +800,12 @@ public sealed class MinervaWorkerService
                             return;
                         }
                         catch (OperationCanceledException) { break; }
+                        catch (PermanentUploadException ex)
+                        {
+                            lastErr = ex;
+                            log($"UL-DEFER-FAIL [{vm.Label}] Permanent rejection: {ExceptionSummary(ex)}");
+                            break; // Stop deferring — server will never accept this file.
+                        }
                         catch (Exception ex)
                         {
                             lastErr = ex;
@@ -710,6 +816,7 @@ public sealed class MinervaWorkerService
                     }
                 }
                 finally { cache.Release(fileSize); }
+                if (ct.IsCancellationRequested) return;
             }
         }
 

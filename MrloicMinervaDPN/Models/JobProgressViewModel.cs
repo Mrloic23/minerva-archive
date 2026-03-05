@@ -1,10 +1,11 @@
 using System;
 using System.Diagnostics;
+using Avalonia.Media;
 using CommunityToolkit.Mvvm.ComponentModel;
 
 namespace MrloicMinervaDPN.Models;
 
-public enum JobStatus { Pending, Downloading, Uploading, Retrying, Done, Failed }
+public enum JobStatus { Pending, Downloading, Queued, Uploading, Retrying, Done, Failed }
 
 public partial class JobProgressViewModel : ObservableObject
 {
@@ -28,6 +29,7 @@ public partial class JobProgressViewModel : ObservableObject
     {
         JobStatus.Pending     => "Pending",
         JobStatus.Downloading => "Downloading",
+        JobStatus.Queued      => "Queued",
         JobStatus.Uploading   => "Uploading",
         JobStatus.Retrying    => CurrentAttempt > 0 && MaxAttempts > 0
                                     ? $"Retrying {CurrentAttempt}/{MaxAttempts}"
@@ -54,8 +56,24 @@ public partial class JobProgressViewModel : ObservableObject
     public bool IsActive => Status is JobStatus.Downloading or JobStatus.Uploading;
     public bool IsFailed => Status == JobStatus.Failed;
     public bool IsRetrying => Status == JobStatus.Retrying;
+    public bool IsQueued => Status == JobStatus.Queued;
     /// <summary>True when status needs no special color (Pending, Downloading, Uploading, Done).</summary>
-    public bool IsNormal => !IsFailed && !IsRetrying;
+    public bool IsNormal => !IsFailed && !IsRetrying && !IsQueued;
+
+    private static readonly SolidColorBrush BrushGreen   = new(Color.Parse("#4CAF50"));
+    private static readonly SolidColorBrush BrushBlue    = new(Color.Parse("#42A5F5"));
+    private static readonly SolidColorBrush BrushOrange  = new(Color.Parse("#FF9800"));
+    private static readonly SolidColorBrush BrushRed     = new(Color.Parse("#EF5350"));
+    private static readonly SolidColorBrush BrushDefault = new(Color.Parse("#555555"));
+
+    public ISolidColorBrush StatusColor => Status switch
+    {
+        JobStatus.Downloading or JobStatus.Uploading or JobStatus.Done => BrushGreen,
+        JobStatus.Queued   => BrushBlue,
+        JobStatus.Retrying => BrushOrange,
+        JobStatus.Failed   => BrushRed,
+        _                  => BrushDefault,
+    };
 
     /// <summary>Call from progress callbacks to update speed. Thread-safe.</summary>
     public void UpdateSpeed(long bytesNow)
@@ -106,10 +124,12 @@ public partial class JobProgressViewModel : ObservableObject
     partial void OnStatusChanged(JobStatus value)
     {
         OnPropertyChanged(nameof(StatusText));
+        OnPropertyChanged(nameof(StatusColor));
         OnPropertyChanged(nameof(HasError));
         OnPropertyChanged(nameof(IsActive));
         OnPropertyChanged(nameof(IsFailed));
         OnPropertyChanged(nameof(IsRetrying));
+        OnPropertyChanged(nameof(IsQueued));
         OnPropertyChanged(nameof(IsNormal));
     }
 

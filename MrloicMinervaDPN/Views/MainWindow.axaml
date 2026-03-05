@@ -126,6 +126,15 @@
                                    HorizontalAlignment="Center" Foreground="#FF9800"
                                    IsVisible="{Binding UploadSpeedText, Converter={x:Static StringConverters.IsNotNullOrEmpty}}"/>
                     </StackPanel>
+                    <!-- Per-state job counters -->
+                    <Grid ColumnDefinitions="Auto,8,Auto" HorizontalAlignment="Center" RowDefinitions="Auto,Auto,Auto" Margin="0 4 0 0">
+                        <TextBlock Grid.Row="0" Grid.Column="0" Text="{Binding DownloadingCount}" FontSize="12" FontFamily="Consolas,Menlo,monospace" Foreground="#42A5F5" HorizontalAlignment="Right"/>
+                        <TextBlock Grid.Row="0" Grid.Column="2" Text="Downloading" FontSize="12" Foreground="#42A5F5"/>
+                        <TextBlock Grid.Row="1" Grid.Column="0" Text="{Binding QueuedCount}" FontSize="12" FontFamily="Consolas,Menlo,monospace" Foreground="#64B5F6" HorizontalAlignment="Right"/>
+                        <TextBlock Grid.Row="1" Grid.Column="2" Text="Queued" FontSize="12" Foreground="#64B5F6"/>
+                        <TextBlock Grid.Row="2" Grid.Column="0" Text="{Binding UploadingCount}" FontSize="12" FontFamily="Consolas,Menlo,monospace" Foreground="#FF9800" HorizontalAlignment="Right"/>
+                        <TextBlock Grid.Row="2" Grid.Column="2" Text="Uploading" FontSize="12" Foreground="#FF9800"/>
+                    </Grid>
                 </StackPanel>
 
                 <!-- Update available banner -->
@@ -288,6 +297,14 @@
                                                            Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
                                                            IsVisible="{Binding IsNormal}"/>
 
+                                                <!-- status — queued (blue) -->
+                                                <TextBlock Grid.Row="0" Grid.Column="2"
+                                                           Text="{Binding StatusText}"
+                                                           FontSize="11" FontWeight="SemiBold"
+                                                           VerticalAlignment="Center"
+                                                           Foreground="#42A5F5"
+                                                           IsVisible="{Binding IsQueued}"/>
+
                                                 <!-- status — retrying (orange) -->
                                                 <TextBlock Grid.Row="0" Grid.Column="2"
                                                            Text="{Binding StatusText}"
@@ -305,9 +322,10 @@
                                                            IsVisible="{Binding IsFailed}"/>
 
                                                 <!-- progress bar -->
-                                                <ProgressBar Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3"
+                                                <ProgressBar Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3" 
                                                              Value="{Binding Progress}"
                                                              Minimum="0" Maximum="100" Height="5"
+                                                             Foreground="{Binding StatusColor}"
                                                              Margin="0 2 0 0"/>
 
                                                 <!-- transfer size (e.g. 245 MB / 1.2 GB) -->

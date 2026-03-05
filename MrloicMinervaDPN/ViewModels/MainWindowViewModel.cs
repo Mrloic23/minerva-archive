@@ -53,6 +53,11 @@ public partial class MainWindowViewModel : ViewModelBase
     [ObservableProperty] private long _totalBytesUploaded;
     [ObservableProperty] private int _filesFailed;
 
+    // ── Live job counts (updated by the speed timer) ───────────────────────
+    [ObservableProperty] private int _downloadingCount;
+    [ObservableProperty] private int _queuedCount;
+    [ObservableProperty] private int _uploadingCount;
+
     public bool HasSessionStats => FilesUploaded > 0 || FilesFailed > 0;
     public bool HasFailedJobs   => FilesFailed > 0;
     public string FilesUploadedText     => $"{FilesUploaded} file{(FilesUploaded != 1 ? "s" : "")} uploaded";
@@ -182,13 +187,18 @@ public partial class MainWindowViewModel : ViewModelBase
         _speedTimer.Tick += (_, _) =>
         {
             double dl = 0, ul = 0;
+            int dlCount = 0, qCount = 0, ulCount = 0;
             foreach (var j in ActiveJobs)
             {
-                if (j.Status == JobStatus.Downloading) dl += j.CurrentSpeedBps;
-                else if (j.Status == JobStatus.Uploading)  ul += j.CurrentSpeedBps;
+                if (j.Status == JobStatus.Downloading) { dl += j.CurrentSpeedBps; dlCount++; }
+                else if (j.Status == JobStatus.Queued)    qCount++;
+                else if (j.Status == JobStatus.Uploading) { ul += j.CurrentSpeedBps; ulCount++; }
             }
             DownloadSpeedText = dl > 0 ? $"↓ {FormatSpeed(dl)}" : "";
             UploadSpeedText   = ul > 0 ? $"↑ {FormatSpeed(ul)}" : "";
+            DownloadingCount = dlCount;
+            QueuedCount      = qCount;
+            UploadingCount   = ulCount;
         };
         _speedTimer.Start();
 
@@ -280,6 +290,7 @@ public partial class MainWindowViewModel : ViewModelBase
     {
         StartWorkerCommand.NotifyCanExecuteChanged();
         StopWorkerCommand.NotifyCanExecuteChanged();
+        if (!value) { DownloadingCount = 0; QueuedCount = 0; UploadingCount = 0; }
     }
 
     partial void OnFilesUploadedChanged(int value)
