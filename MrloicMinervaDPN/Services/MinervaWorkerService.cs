@@ -27,8 +27,7 @@ public sealed class MinervaWorkerService
     /// <summary>Retry delays for deferred jobs. Once the last value is reached it repeats indefinitely.</summary>
     private static readonly TimeSpan[] DeferSchedule =
     [
-        TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(10),
-        TimeSpan.FromMinutes(20), TimeSpan.FromMinutes(30)
+        TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(2)
     ];
 
     /// <summary>Tracks total bytes of downloaded-but-not-yet-uploaded files that are cached
