@@ -27,6 +27,10 @@ public partial class App : Application
             {
                 DataContext = new MainWindowViewModel(),
             };
+
+            if (desktop.Args!.Contains("--auto-start-worker"))
+                if (desktop.MainWindow.DataContext is MainWindowViewModel mainWindowViewModel)
+                    mainWindowViewModel.StartWorkerCommand.Execute(null);
         }
 
         base.OnFrameworkInitializationCompleted();
