@@ -7,18 +7,9 @@ namespace MrloicMinervaDPN.Services;
 
 public sealed class PersistedSettings
 {
-    public string  ServerUrl            { get; set; } = "https://api.minerva-archive.org";
-    public string  UploadServerUrl      { get; set; } = "https://gate.minerva-archive.org";
-    public decimal Concurrency          { get; set; } = 4;
-    public decimal UploadConcurrency    { get; set; } = 4;
-    public decimal BatchSize            { get; set; } = 4;
-    public decimal Aria2cConnections    { get; set; } = 16;
-    public bool    AutoInstallAria2c    { get; set; } = true;
-    public string  TempDir              { get; set; } = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".minerva-dpn", "tmp");
-    public bool    KeepFiles            { get; set; } = false;
-    public decimal InMemoryThresholdMb  { get; set; } = 0;
-    public decimal MaxCacheSizeMb       { get; set; } = 10240;
+    public string  ServerUrl   { get; set; } = "https://firehose.minerva-archive.org";
+    public decimal Concurrency { get; set; } = 2;
+    public decimal Retries     { get; set; } = 5;
 }
 
 public static class SettingsStore

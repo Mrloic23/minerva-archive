@@ -178,65 +178,29 @@
             <Border Grid.Row="0" Padding="20 14"
                     BorderBrush="{DynamicResource SystemControlForegroundBaseLowBrush}"
                     BorderThickness="0 0 0 1">
-                <Grid ColumnDefinitions="*,20,*,20,*">
+                <Grid ColumnDefinitions="*,20,*">
 
                     <!-- Servers -->
                     <StackPanel Grid.Column="0">
                         <TextBlock Classes="SectionHeader" Text="SERVERS" Margin="0 0 0 6"/>
-                        <TextBlock Text="API Server" FontSize="11" Margin="0 0 0 2"
+                        <TextBlock Text="Coordinator Server" FontSize="11" Margin="0 0 0 2"
                                    Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
                         <TextBox Classes="Setting" Text="{Binding ServerUrl}"/>
-                        <TextBlock Text="Upload Server" FontSize="11" Margin="0 4 0 2"
-                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
-                        <TextBox Classes="Setting" Text="{Binding UploadServerUrl}"/>
                     </StackPanel>
 
                     <!-- Performance -->
                     <StackPanel Grid.Column="2">
                         <TextBlock Classes="SectionHeader" Text="PERFORMANCE" Margin="0 0 0 6"/>
-                        <TextBlock Text="Download Concurrency" FontSize="11" Margin="0 0 0 2"
-                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
+                        <TextBlock Text="Concurrency" FontSize="11" Margin="0 0 0 2"
+                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
+                                   ToolTip.Tip="Number of chunks to download and upload in parallel."/>
                         <NumericUpDown Classes="Setting" Value="{Binding Concurrency}"
                                        Minimum="1" Maximum="32" Increment="1"/>
-                        <TextBlock Text="Upload Concurrency" FontSize="11" Margin="0 0 0 2"
-                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
-                        <NumericUpDown Classes="Setting" Value="{Binding UploadConcurrency}"
-                                       Minimum="1" Maximum="32" Increment="1"/>
-                        <TextBlock Text="Batch Size" FontSize="11" Margin="0 0 0 2"
-                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
-                        <NumericUpDown Classes="Setting" Value="{Binding BatchSize}"
-                                       Minimum="1" Maximum="100" Increment="1"/>
-                        <TextBlock Text="aria2c Connections" FontSize="11" Margin="0 0 0 2"
-                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
-                        <NumericUpDown Classes="Setting" Value="{Binding Aria2cConnections}"
-                                       Minimum="1" Maximum="64" Increment="1"/>
-                        <CheckBox Content="Auto-install aria2c if missing"
-                                  IsChecked="{Binding AutoInstallAria2c}"
-                                  Margin="0 6 0 0"
-                                  ToolTip.Tip="Download aria2c automatically on first run if it is not installed. Disable if you prefer to manage aria2c yourself."/>
-                    </StackPanel>
-
-                    <!-- Storage -->
-                    <StackPanel Grid.Column="4">
-                        <TextBlock Classes="SectionHeader" Text="STORAGE" Margin="0 0 0 6"/>
-                        <TextBlock Text="Temp Directory" FontSize="11" Margin="0 0 0 2"
-                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"/>
-                        <TextBox Classes="Setting" Text="{Binding TempDir}"/>
-                        <CheckBox Content="Keep files after upload"
-                                  IsChecked="{Binding KeepFiles}"
-                                  Margin="0 6 0 0"/>
-                        <TextBlock Text="RAM-only threshold (MB, 0=off)" FontSize="11" Margin="0 8 0 2"
+                        <TextBlock Text="Retries per chunk" FontSize="11" Margin="0 0 0 2"
                                    Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
-                                   ToolTip.Tip="Files whose reported size is at or below this value are downloaded into RAM only and never written to disk. Set to 0 to always use disk."/>
-                        <NumericUpDown Classes="Setting" Value="{Binding InMemoryThresholdMb}"
-                                       Minimum="0" Maximum="1048576" Increment="1"
-                                       FormatString="0"/>
-                        <TextBlock Text="Deferred upload cache (MB, 0=unlimited)" FontSize="11" Margin="0 8 0 2"
-                                   Foreground="{DynamicResource SystemControlForegroundBaseMediumBrush}"
-                                   ToolTip.Tip="Max disk space used by files that have been downloaded but are waiting for the upload server to recover. When the limit is reached, new files are dropped instead of cached."/>
-                        <NumericUpDown Classes="Setting" Value="{Binding MaxCacheSizeMb}"
-                                       Minimum="0" Maximum="1048576" Increment="256"
-                                       FormatString="0"/>
+                                   ToolTip.Tip="How many times to retry a chunk before giving up and returning it to the server."/>
+                        <NumericUpDown Classes="Setting" Value="{Binding Retries}"
+                                       Minimum="1" Maximum="20" Increment="1"/>
                     </StackPanel>
                 </Grid>
             </Border>
